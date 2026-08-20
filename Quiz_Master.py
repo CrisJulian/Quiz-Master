@@ -17,11 +17,23 @@ RadioGroup, PopupMenuButton(content=...), ft.dropdown.Option, etc).
 """
 
 import copy
+import json
+import pathlib
 import random
 import threading
 import time
 
 import flet as ft
+
+# Local cache file, stored right next to this script (works the same on
+# every OS/Flet version — no dependency on Flet's storage controls).
+CACHE_FILE = pathlib.Path(__file__).resolve().parent / "quiz_master_cache.json"
+
+try:
+    import pyrebase
+    PYREBASE_AVAILABLE = True
+except ImportError:
+    PYREBASE_AVAILABLE = False
 
 # ══════════════════════════════════════════════════════════════════════════
 # Academic Clarity Design System Tokens
@@ -100,6 +112,126 @@ def hex_to_light_bg(hex_color, blend=0.85):
     lg = int(g + (255 - g) * blend)
     lb = int(b + (255 - b) * blend)
     return f"#{lr:02x}{lg:02x}{lb:02x}"
+
+
+def slugify(text):
+    """Turn a title into a stable, Firebase-safe key ('World History Quiz' -> 'world_history_quiz')."""
+    cleaned = "".join(c if c.isalnum() else "_" for c in text.strip().lower())
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned.strip("_") or "item"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Firebase (Realtime Database + Anonymous Auth) — shared cloud sync
+# ══════════════════════════════════════════════════════════════════════════
+# 1. Create a project at https://console.firebase.google.com (free tier is fine)
+# 2. Build > Realtime Database > Create database (start in locked mode)
+# 3. Build > Authentication > Sign-in method > enable "Anonymous"
+# 4. Project settings > General > Your apps > Add app > Web  -> copy the config below
+# 5. Realtime Database > Rules, set:
+#    { "rules": { ".read": "auth != null", ".write": "auth != null" } }
+# The apiKey below is a public project identifier, not a secret — it's safe to
+# ship in the app. The security rules above are what actually protect the data.
+
+FIREBASE_CONFIG = {
+    "apiKey": "AIzaSyCp4-T3q_IdXLvNwuZs145KO8FnOLaR4rE",
+    "authDomain": "quiz-master-dadf5.firebaseapp.com",
+    "databaseURL": "https://quiz-master-dadf5-default-rtdb.firebaseio.com",
+    "projectId": "quiz-master-dadf5",
+    "storageBucket": "quiz-master-dadf5.firebasestorage.app",
+    "appId": "1:15147716655:web:4c4f39120aedbfb370f6da",
+}
+
+
+class CloudStore:
+    """Thin wrapper around Firebase Realtime Database + Anonymous Auth.
+
+    Every method is best-effort: if the device is offline, or Firebase hasn't
+    been configured yet, calls simply no-op (self.connected stays False) so
+    the app keeps working entirely off the local cache.
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.connected = False
+        self.id_token = None
+        self.db = None
+        self.last_error = None
+
+    def connect(self):
+        if not PYREBASE_AVAILABLE:
+            self.last_error = "pyrebase4 not installed (pip install pyrebase4)"
+            return
+        api_key = self.config.get("apiKey", "")
+        if not api_key or api_key.startswith("YOUR_"):
+            self.last_error = "Firebase not configured yet (edit FIREBASE_CONFIG)"
+            return
+        try:
+            app = pyrebase.initialize_app(self.config)
+            user = app.auth().sign_in_anonymous()
+            self.id_token = user["idToken"]
+            self.db = app.database()
+            self.connected = True
+        except Exception as e:
+            self.last_error = str(e)
+            self.connected = False
+
+    def fetch_all(self):
+        """Returns (quizzes, drafts, subjects) or None on failure."""
+        if not self.connected:
+            return None
+        try:
+            quizzes_raw = self.db.child("quizzes").get(self.id_token).val() or {}
+            drafts_raw = self.db.child("drafts").get(self.id_token).val() or {}
+            subjects_raw = self.db.child("subjects").get(self.id_token).val()
+            quizzes = list(quizzes_raw.values()) if isinstance(quizzes_raw, dict) else []
+            drafts = [dict(v, _key=k) for k, v in drafts_raw.items()] if isinstance(drafts_raw, dict) else []
+            subjects = subjects_raw if isinstance(subjects_raw, list) else None
+            return quizzes, drafts, subjects
+        except Exception as e:
+            self.last_error = str(e)
+            return None
+
+    def save_quiz(self, quiz):
+        if not self.connected:
+            return
+        try:
+            self.db.child("quizzes").child(quiz["id"]).set(quiz, self.id_token)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def delete_quiz(self, quiz_id):
+        if not self.connected:
+            return
+        try:
+            self.db.child("quizzes").child(quiz_id).remove(self.id_token)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def save_draft(self, draft_payload, key):
+        if not self.connected:
+            return
+        try:
+            self.db.child("drafts").child(key).set(draft_payload, self.id_token)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def delete_draft(self, key):
+        if not self.connected:
+            return
+        try:
+            self.db.child("drafts").child(key).remove(self.id_token)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def save_subjects(self, subjects):
+        if not self.connected:
+            return
+        try:
+            self.db.child("subjects").set(subjects, self.id_token)
+        except Exception as e:
+            self.last_error = str(e)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -223,11 +355,22 @@ class ProfQuizzerApp:
         page.window.height = 860
         page.window.min_width = 340
 
-        # ---- Data ----
+        # ---- Data (bundled defaults, overridden by local cache / cloud below) ----
         self.quizzes = copy.deepcopy(SAMPLE_QUIZZES)
         self.drafts = copy.deepcopy(SAMPLE_DRAFTS)
         self.subjects = ["Science", "Biology", "Mathematics", "History",
                           "Computer Science", "Literature", "General Knowledge"]
+
+        # ---- Local cache (plain JSON file next to the script) — lets the app
+        # work offline and remember your data between launches, before Firebase
+        # even connects. Deliberately not using ft.SharedPreferences here: its
+        # API differs across Flet versions (sync vs async), so a plain file is
+        # more predictable and works the same everywhere.
+        self._load_local_cache()
+
+        # ---- Cloud sync (Firebase) — shared data between you and your friends ----
+        self.cloud = CloudStore(FIREBASE_CONFIG)
+        self.current_route = "dashboard"
 
         # ---- Session state ----
         self.current_quiz = None
@@ -258,6 +401,67 @@ class ProfQuizzerApp:
         )
 
         self.goto_dashboard()
+
+        # Connect to Firebase and sync in the background so app startup is
+        # never blocked waiting on the network.
+        threading.Thread(target=self._connect_and_sync, daemon=True).start()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Persistence: local cache + cloud sync
+    # ──────────────────────────────────────────────────────────────────
+    def _load_local_cache(self):
+        try:
+            if CACHE_FILE.exists():
+                data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+                if data.get("quizzes"):
+                    self.quizzes = data["quizzes"]
+                if data.get("drafts"):
+                    self.drafts = data["drafts"]
+                if data.get("subjects"):
+                    self.subjects = data["subjects"]
+        except Exception as e:
+            print("Local cache unavailable, using bundled samples:", e)
+
+    def _save_local_cache(self):
+        try:
+            CACHE_FILE.write_text(
+                json.dumps({
+                    "quizzes": self.quizzes,
+                    "drafts": self.drafts,
+                    "subjects": self.subjects,
+                }, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            print("Could not write local cache:", e)
+
+    def _connect_and_sync(self):
+        self.cloud.connect()
+        if not self.cloud.connected:
+            print("Cloud sync unavailable:", self.cloud.last_error)
+            return
+        result = self.cloud.fetch_all()
+        if not result:
+            return
+        quizzes, drafts, subjects = result
+        if quizzes:
+            self.quizzes = quizzes
+        if drafts:
+            self.drafts = drafts
+        if subjects:
+            self.subjects = subjects
+        self._save_local_cache()
+        self._on_cloud_synced()
+
+    def _on_cloud_synced(self):
+        try:
+            self.toast("☁ Synced with the cloud")
+        except Exception:
+            pass
+        if self.current_route == "dashboard":
+            self._set_body(self.build_dashboard(), active_nav=0)
+        elif self.current_route == "library":
+            self._set_body(self.build_library(), active_nav=1)
 
     # ──────────────────────────────────────────────────────────────────
     # Small helpers
@@ -523,7 +727,7 @@ class ProfQuizzerApp:
         )
 
         fab = ft.Container(
-            content=ft.Text("+", size=30, color="white", weight=ft.FontWeight.W_300),
+            content=ft.Icon(ft.Icons.ADD, color="white", size=28),
             width=54, height=54, bgcolor=PRIMARY, border_radius=27,
             alignment=ft.Alignment.CENTER, shadow=CARD_SHADOW, ink=True,
             on_click=lambda e: self.goto_create_setup(),
@@ -628,6 +832,9 @@ class ProfQuizzerApp:
     def _delete_draft(self, draft):
         def do_delete():
             self.drafts = [d for d in self.drafts if d is not draft]
+            self._save_local_cache()
+            key = draft.get("_key") or slugify(draft.get("title", "draft"))
+            threading.Thread(target=self.cloud.delete_draft, args=(key,), daemon=True).start()
             self._set_body(self.build_dashboard())
         self.dialog_confirm("Delete Draft", f"Remove draft '{draft.get('title', 'Untitled')}'?", do_delete)
 
@@ -649,6 +856,8 @@ class ProfQuizzerApp:
     def _confirm_delete_quiz(self, quiz):
         def do_delete():
             self.quizzes = [q for q in self.quizzes if q["id"] != quiz["id"]]
+            self._save_local_cache()
+            threading.Thread(target=self.cloud.delete_quiz, args=(quiz["id"],), daemon=True).start()
             self._set_body(self.build_dashboard())
             self.toast(f"'{quiz['title']}' has been deleted.", bgcolor=ERROR)
         self.dialog_confirm("Delete Quiz", f"Are you sure you want to delete '{quiz['title']}'?\nThis cannot be undone.", do_delete)
@@ -690,7 +899,7 @@ class ProfQuizzerApp:
         )
 
         fab = ft.Container(
-            content=ft.Text("+", size=30, color="white", weight=ft.FontWeight.W_300),
+            content=ft.Icon(ft.Icons.ADD, color="white", size=28),
             width=54, height=54, bgcolor=PRIMARY, border_radius=27,
             alignment=ft.Alignment.CENTER, shadow=CARD_SHADOW, ink=True,
             on_click=lambda e: self.goto_create_setup(),
@@ -751,6 +960,8 @@ class ProfQuizzerApp:
         def added(subj):
             if subj not in self.subjects:
                 self.subjects.append(subj)
+                self._save_local_cache()
+                threading.Thread(target=self.cloud.save_subjects, args=(list(self.subjects),), daemon=True).start()
             self.toast(f"Subject '{subj}' is now available!")
             self._set_body(self.build_library(), active_nav=1)
         self.dialog_text_input("Add New Subject", "Enter custom subject name", added)
@@ -944,6 +1155,8 @@ class ProfQuizzerApp:
         def added(subj):
             if subj not in self.subjects:
                 self.subjects.append(subj)
+                self._save_local_cache()
+                threading.Thread(target=self.cloud.save_subjects, args=(list(self.subjects),), daemon=True).start()
             self.combo_subject.options = [ft.dropdown.Option(s) for s in self.subjects]
             self.combo_subject.value = subj
             self.combo_subject.update()
@@ -1013,9 +1226,10 @@ class ProfQuizzerApp:
             else "+ Add New Question", size=15, weight=ft.FontWeight.W_800, color=PRIMARY,
         )
 
+        # Added color="black"
         self.input_question_text = ft.TextField(
             hint_text="Type question prompt here...", multiline=True, min_lines=3, max_lines=4,
-            border_radius=12, border_color=BORDER_COLOR,
+            border_radius=12, border_color=BORDER_COLOR, color="black",
         )
         q_card = card(ft.Column([field_label("Question Prompt"), self.input_question_text], spacing=8))
 
@@ -1029,9 +1243,10 @@ class ProfQuizzerApp:
                 content=ft.Text(f" {LETTERS[i]} ", size=12, weight=ft.FontWeight.W_800, color=PRIMARY),
                 bgcolor=SURFACE_LOW, border_radius=6, padding=ft.Padding.symmetric(horizontal=6, vertical=4),
             )
+            # Added color="black"
             opt_edit = ft.TextField(hint_text=f"Option {LETTERS[i]} text...", height=40,
                                      border_radius=10, border_color=BORDER_COLOR,
-                                     content_padding=ft.Padding.only(left=12), expand=True)
+                                     content_padding=ft.Padding.only(left=12), expand=True, color="black")
             self.opt_inputs.append(opt_edit)
             self.opt_tags.append(tag)
             row = ft.Container(
@@ -1302,6 +1517,7 @@ class ProfQuizzerApp:
         if not self.new_quiz_data.get("questions"):
             self.dialog_info("No Questions", "Please add at least one question to the quiz.")
             return
+        saved_quiz = None
         if self.editing_quiz_id:
             for i, q in enumerate(self.quizzes):
                 if q["id"] == self.editing_quiz_id:
@@ -1314,11 +1530,12 @@ class ProfQuizzerApp:
                         "edited": "Edited just now",
                         "questions": list(self.new_quiz_data["questions"]),
                     })
+                    saved_quiz = self.quizzes[i]
                     break
             msg = f"'{self.new_quiz_data['title']}' has been updated successfully!"
         else:
             new_id = f"QUIZ{random.randint(100, 999)}"
-            self.quizzes.insert(0, {
+            new_quiz = {
                 "id": new_id, "code": new_id, "title": self.new_quiz_data["title"],
                 "subject": self.new_quiz_data["subject"], "category": self.new_quiz_data["subject"],
                 "description": self.new_quiz_data.get("description", "Created with Quiz Master Studio"),
@@ -1326,10 +1543,15 @@ class ProfQuizzerApp:
                 "time_mins": self.new_quiz_data.get("time_mins", 15), "edited": "Just now",
                 "badge_color": self.new_quiz_data.get("cover_color", PRIMARY), "badge_bg": PRIMARY_LIGHT,
                 "icon": "📝", "students_taken": 0, "questions": list(self.new_quiz_data.get("questions", [])),
-            })
+            }
+            self.quizzes.insert(0, new_quiz)
+            saved_quiz = new_quiz
             msg = f"'{self.new_quiz_data['title']}' has been published with Code: {new_id}!"
 
         self.editing_quiz_id = None
+        self._save_local_cache()
+        if saved_quiz:
+            threading.Thread(target=self.cloud.save_quiz, args=(dict(saved_quiz),), daemon=True).start()
         self.goto_dashboard()
         self.dialog_info("Quiz Saved!", msg)
 
@@ -1340,12 +1562,17 @@ class ProfQuizzerApp:
             "time_mins": self.new_quiz_data.get("time_mins", 15), "icon": "📄",
             "questions": list(self.new_quiz_data.get("questions", [])),
         }
-        existing_idx = next((i for i, d in enumerate(self.drafts) if d["title"] == draft_entry["title"]), None)
+        key = slugify(draft_entry["title"])
+        existing_idx = next((i for i, d in enumerate(self.drafts) if d.get("_key") == key), None)
+        draft_entry["_key"] = key
         if existing_idx is not None:
             self.drafts[existing_idx] = draft_entry
         else:
             self.drafts.insert(0, draft_entry)
         self.editing_quiz_id = None
+        self._save_local_cache()
+        cloud_payload = {k: v for k, v in draft_entry.items() if k != "_key"}
+        threading.Thread(target=self.cloud.save_draft, args=(cloud_payload, key), daemon=True).start()
         self.goto_dashboard()
         self.dialog_info("Saved", f"'{draft_entry['title']}' saved to Recent Drafts!")
 
@@ -1681,11 +1908,13 @@ class ProfQuizzerApp:
     # ──────────────────────────────────────────────────────────────────
     def goto_dashboard(self):
         self.editing_quiz_id = None
+        self.current_route = "dashboard"
         self._set_body(self.build_dashboard(), show_nav=True, active_nav=0)
         self._refresh_bottom_nav()
 
     def goto_library(self):
         self.editing_quiz_id = None
+        self.current_route = "library"
         self._set_body(self.build_library(), show_nav=True, active_nav=1)
         self._refresh_bottom_nav()
 
