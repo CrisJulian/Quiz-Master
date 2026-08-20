@@ -1,0 +1,14 @@
+# Real Firebase credentials — never commit this. Copy from firebase_config.example.py
+firebase_config.py
+
+# Local data cache (your quizzes/drafts) — personal, not shared code
+quiz_master_cache.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Flet build output
+build/

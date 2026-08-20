@@ -131,17 +131,22 @@ def slugify(text):
 # 4. Project settings > General > Your apps > Add app > Web  -> copy the config below
 # 5. Realtime Database > Rules, set:
 #    { "rules": { ".read": "auth != null", ".write": "auth != null" } }
-# The apiKey below is a public project identifier, not a secret — it's safe to
-# ship in the app. The security rules above are what actually protect the data.
-
-FIREBASE_CONFIG = {
-    "apiKey": "AIzaSyCp4-T3q_IdXLvNwuZs145KO8FnOLaR4rE",
-    "authDomain": "quiz-master-dadf5.firebaseapp.com",
-    "databaseURL": "https://quiz-master-dadf5-default-rtdb.firebaseio.com",
-    "projectId": "quiz-master-dadf5",
-    "storageBucket": "quiz-master-dadf5.firebasestorage.app",
-    "appId": "1:15147716655:web:4c4f39120aedbfb370f6da",
-}
+#
+# Your real config lives in firebase_config.py, which is gitignored — it is
+# NEVER committed to a public repo. This file is safe to publish as-is: if
+# firebase_config.py isn't present, the app just runs in local-only mode.
+# See firebase_config.example.py for the template to copy.
+try:
+    from firebase_config import FIREBASE_CONFIG
+except ImportError:
+    FIREBASE_CONFIG = {
+        "apiKey": "YOUR_API_KEY",
+        "authDomain": "YOUR_PROJECT.firebaseapp.com",
+        "databaseURL": "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+        "projectId": "YOUR_PROJECT",
+        "storageBucket": "YOUR_PROJECT.appspot.com",
+        "appId": "YOUR_APP_ID",
+    }
 
 
 class CloudStore:
@@ -727,7 +732,7 @@ class ProfQuizzerApp:
         )
 
         fab = ft.Container(
-            content=ft.Icon(ft.Icons.ADD, color="white", size=28),
+            content=ft.Text("+", size=30, color="white", weight=ft.FontWeight.W_300),
             width=54, height=54, bgcolor=PRIMARY, border_radius=27,
             alignment=ft.Alignment.CENTER, shadow=CARD_SHADOW, ink=True,
             on_click=lambda e: self.goto_create_setup(),
@@ -899,7 +904,7 @@ class ProfQuizzerApp:
         )
 
         fab = ft.Container(
-            content=ft.Icon(ft.Icons.ADD, color="white", size=28),
+            content=ft.Text("+", size=30, color="white", weight=ft.FontWeight.W_300),
             width=54, height=54, bgcolor=PRIMARY, border_radius=27,
             alignment=ft.Alignment.CENTER, shadow=CARD_SHADOW, ink=True,
             on_click=lambda e: self.goto_create_setup(),
