@@ -17,23 +17,71 @@ RadioGroup, PopupMenuButton(content=...), ft.dropdown.Option, etc).
 """
 
 import copy
+import http.server
 import json
 import pathlib
 import random
+import secrets
 import threading
 import time
+import urllib.parse
+import webbrowser
 
 import flet as ft
 
-# Local cache file, stored right next to this script (works the same on
-# every OS/Flet version — no dependency on Flet's storage controls).
-CACHE_FILE = pathlib.Path(__file__).resolve().parent / "quiz_master_cache.json"
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
+# Local cache lives next to this script, one JSON file per signed-in user
+# (works the same on every OS/Flet version — no dependency on Flet's
+# storage controls). See _cache_path_for() below.
+CACHE_DIR = pathlib.Path(__file__).resolve().parent
+
+
+def _cache_path_for(email_or_uid):
+    safe = "".join(c if c.isalnum() else "_" for c in (email_or_uid or "guest").lower())
+    return CACHE_DIR / f"quiz_master_cache_{safe}.json"
+
 
 try:
     import pyrebase
     PYREBASE_AVAILABLE = True
 except ImportError:
     PYREBASE_AVAILABLE = False
+
+SESSION_FILE = CACHE_DIR / "quiz_master_session.json"
+
+
+def _save_session(refresh_token, uid, email):
+    """Persist a refresh token locally so the user stays logged in on this
+    device across app restarts (same idea as browser 'remember me')."""
+    try:
+        SESSION_FILE.write_text(
+            json.dumps({"refresh_token": refresh_token, "uid": uid, "email": email}),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print("Could not save session:", e)
+
+
+def _load_session():
+    try:
+        if SESSION_FILE.exists():
+            return json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        print("Could not load session:", e)
+    return None
+
+
+def _clear_session():
+    try:
+        if SESSION_FILE.exists():
+            SESSION_FILE.unlink()
+    except Exception as e:
+        print("Could not clear session:", e)
 
 # ══════════════════════════════════════════════════════════════════════════
 # Academic Clarity Design System Tokens
@@ -123,21 +171,34 @@ def slugify(text):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Firebase (Realtime Database + Anonymous Auth) — shared cloud sync
+# Firebase (Realtime Database + Email/Password Auth) — real accounts, each
+# with their own private quizzes/drafts/subjects.
 # ══════════════════════════════════════════════════════════════════════════
 # 1. Create a project at https://console.firebase.google.com (free tier is fine)
 # 2. Build > Realtime Database > Create database (start in locked mode)
-# 3. Build > Authentication > Sign-in method > enable "Anonymous"
+# 3. Build > Authentication > Sign-in method > enable "Email/Password"
 # 4. Project settings > General > Your apps > Add app > Web  -> copy the config below
-# 5. Realtime Database > Rules, set:
-#    { "rules": { ".read": "auth != null", ".write": "auth != null" } }
+# 5. Realtime Database > Rules, set (scopes every user to their own subtree):
+#    {
+#      "rules": {
+#        "users": {
+#          "$uid": {
+#            ".read": "auth != null && auth.uid == $uid",
+#            ".write": "auth != null && auth.uid == $uid"
+#          }
+#        }
+#      }
+#    }
 #
 # Your real config lives in firebase_config.py, which is gitignored — it is
 # NEVER committed to a public repo. This file is safe to publish as-is: if
-# firebase_config.py isn't present, the app just runs in local-only mode.
+# firebase_config.py isn't present, the login screen will say Firebase isn't
+# configured yet (you can still use "Continue without an account" to try the
+# app locally).
 # See firebase_config.example.py for the template to copy.
+
 try:
-    from firebase_config import FIREBASE_CONFIG
+    from firebase_config import FIREBASE_CONFIG, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 except ImportError:
     FIREBASE_CONFIG = {
         "apiKey": "YOUR_API_KEY",
@@ -147,10 +208,159 @@ except ImportError:
         "storageBucket": "YOUR_PROJECT.appspot.com",
         "appId": "YOUR_APP_ID",
     }
+    GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID"
+    GOOGLE_CLIENT_SECRET = "YOUR_GOOGLE_CLIENT_SECRET"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Manual Google OAuth (works identically on desktop, web, and mobile — does
+# NOT depend on Flet's built-in page.login(), which currently raises
+# NotImplementedError on every transport in this Flet version).
+#
+# Flow: open the system browser to Google's consent screen -> a throwaway
+# local HTTP server on this machine catches the redirect with an
+# authorization code -> we exchange that code for a Google ID token ->
+# we hand that ID token to Firebase's accounts:signInWithIdp REST endpoint
+# to get a real Firebase session (same idToken/refreshToken/uid shape as
+# email/password sign-in).
+#
+# IMPORTANT: register this exact URL as an "Authorized redirect URI" on
+# your Google Cloud Console OAuth 2.0 Client (Web application type):
+#   http://localhost:8551/oauth2callback
+# ══════════════════════════════════════════════════════════════════════════
+
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+FIREBASE_SIGN_IN_WITH_IDP_ENDPOINT = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp"
+
+# Deliberately NOT the same port your Flet app itself listens on, so the
+# two servers never collide (e.g. if you run `flet run --web` on 8550,
+# this still works fine on 8551).
+OAUTH_CALLBACK_HOST = "localhost"
+OAUTH_CALLBACK_PORT = 8551
+OAUTH_CALLBACK_PATH = "/oauth2callback"
+OAUTH_REDIRECT_URL = f"http://{OAUTH_CALLBACK_HOST}:{OAUTH_CALLBACK_PORT}{OAUTH_CALLBACK_PATH}"
+
+
+class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+    """One-shot handler that captures ?code=...&state=... from Google's
+    redirect, then tells the browser tab it can close itself."""
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != OAUTH_CALLBACK_PATH:
+            self.send_response(404)
+            self.end_headers()
+            return
+        params = urllib.parse.parse_qs(parsed.query)
+        self.server.oauth_result = {
+            "code": params.get("code", [None])[0],
+            "state": params.get("state", [None])[0],
+            "error": params.get("error", [None])[0],
+        }
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(
+            b"<html><body style='font-family:sans-serif;text-align:center;padding-top:80px;'>"
+            b"<h2>Signed in!</h2><p>You can close this window and return to Quiz Master.</p>"
+            b"<script>window.close();</script></body></html>"
+        )
+
+    def log_message(self, format, *args):
+        pass  # silence default per-request console logging
+
+
+def _run_google_oauth_flow(client_id, client_secret, timeout=120):
+    """Blocking. Runs the full Authorization Code flow against Google.
+    Returns (id_token, access_token, error). Call this from a background
+    thread, never from the UI thread, since it blocks until the user
+    finishes (or times out) in their browser.
+    """
+    if not REQUESTS_AVAILABLE:
+        return None, None, "The 'requests' package is required (pip install requests)."
+    if not client_id or client_id.startswith("YOUR_"):
+        return None, None, "Google OAuth isn't configured yet (edit firebase_config.py)."
+
+    state = secrets.token_urlsafe(16)
+    params = {
+        "client_id": client_id,
+        "redirect_uri": OAUTH_REDIRECT_URL,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "access_type": "online",
+        "prompt": "select_account",
+    }
+    auth_url = f"{GOOGLE_AUTH_ENDPOINT}?{urllib.parse.urlencode(params)}"
+
+    try:
+        httpd = http.server.HTTPServer((OAUTH_CALLBACK_HOST, OAUTH_CALLBACK_PORT), _OAuthCallbackHandler)
+    except OSError as e:
+        return None, None, f"Couldn't start local sign-in listener on port {OAUTH_CALLBACK_PORT}: {e}"
+
+    httpd.oauth_result = None
+    httpd.timeout = 1  # seconds per handle_request() poll
+
+    webbrowser.open(auth_url)
+
+    waited = 0
+    while httpd.oauth_result is None and waited < timeout:
+        httpd.handle_request()
+        waited += 1
+    httpd.server_close()
+
+    result = httpd.oauth_result
+    if result is None:
+        return None, None, "Timed out waiting for Google sign-in. Please try again."
+    if result.get("error"):
+        return None, None, f"Google sign-in was cancelled or denied ({result['error']})."
+    if result.get("state") != state:
+        return None, None, "Sign-in response failed a security check. Please try again."
+    code = result.get("code")
+    if not code:
+        return None, None, "Google did not return an authorization code."
+
+    try:
+        token_resp = requests.post(GOOGLE_TOKEN_ENDPOINT, data={
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": OAUTH_REDIRECT_URL,
+            "grant_type": "authorization_code",
+        }, timeout=15)
+        token_resp.raise_for_status()
+    except Exception as e:
+        return None, None, f"Google token exchange failed: {e}"
+
+    token_data = token_resp.json()
+    return token_data.get("id_token"), token_data.get("access_token"), None
+
+_FIREBASE_ERROR_MESSAGES = {
+    "EMAIL_EXISTS": "An account with that email already exists. Try logging in instead.",
+    "EMAIL_NOT_FOUND": "No account found with that email. Try signing up instead.",
+    "INVALID_PASSWORD": "Incorrect password. Please try again.",
+    "INVALID_LOGIN_CREDENTIALS": "Incorrect email or password. Please try again.",
+    "USER_DISABLED": "This account has been disabled.",
+    "WEAK_PASSWORD": "Password should be at least 6 characters.",
+    "INVALID_EMAIL": "That doesn't look like a valid email address.",
+    "TOO_MANY_ATTEMPTS_TRY_LATER": "Too many attempts. Please wait a moment and try again.",
+}
+
+
+def _friendly_firebase_error(exc):
+    """Turn pyrebase's raw HTTPError body into a readable message."""
+    raw = str(exc)
+    for code, friendly in _FIREBASE_ERROR_MESSAGES.items():
+        if code in raw:
+            return friendly
+    return "Something went wrong talking to the server. Please try again."
 
 
 class CloudStore:
-    """Thin wrapper around Firebase Realtime Database + Anonymous Auth.
+    """Thin wrapper around Firebase Realtime Database + Email/Password Auth.
+
+    Each signed-in user gets their own private subtree at users/{uid}/... in
+    the Realtime Database, so accounts never see each other's quizzes.
 
     Every method is best-effort: if the device is offline, or Firebase hasn't
     been configured yet, calls simply no-op (self.connected stays False) so
@@ -161,35 +371,156 @@ class CloudStore:
         self.config = config
         self.connected = False
         self.id_token = None
+        self.refresh_token = None
+        self.uid = None
+        self.email = None
         self.db = None
+        self.auth = None
         self.last_error = None
 
-    def connect(self):
+    def _init_app(self):
+        """Initialize the Firebase app/auth handle (without signing in)."""
+        if self.auth is not None and self.db is not None:
+            return True
         if not PYREBASE_AVAILABLE:
             self.last_error = "pyrebase4 not installed (pip install pyrebase4)"
-            return
+            return False
         api_key = self.config.get("apiKey", "")
         if not api_key or api_key.startswith("YOUR_"):
-            self.last_error = "Firebase not configured yet (edit FIREBASE_CONFIG)"
-            return
+            self.last_error = "Firebase not configured yet (edit firebase_config.py)"
+            return False
         try:
             app = pyrebase.initialize_app(self.config)
-            user = app.auth().sign_in_anonymous()
-            self.id_token = user["idToken"]
+            self.auth = app.auth()
             self.db = app.database()
-            self.connected = True
+            return True
         except Exception as e:
             self.last_error = str(e)
+            return False
+
+    def sign_up(self, email, password):
+        """Create a brand-new account. Returns (success: bool, error: str|None)."""
+        if not self._init_app():
+            return False, self.last_error
+        try:
+            user = self.auth.create_user_with_email_and_password(email, password)
+            self.id_token = user["idToken"]
+            self.refresh_token = user.get("refreshToken")
+            self.uid = user["localId"]
+            self.email = email
+            self.connected = True
+            return True, None
+        except Exception as e:
+            self.last_error = _friendly_firebase_error(e)
             self.connected = False
+            return False, self.last_error
+
+    def sign_in(self, email, password):
+        """Log in to an existing account. Returns (success: bool, error: str|None)."""
+        if not self._init_app():
+            return False, self.last_error
+        try:
+            user = self.auth.sign_in_with_email_and_password(email, password)
+            self.id_token = user["idToken"]
+            self.refresh_token = user.get("refreshToken")
+            self.uid = user["localId"]
+            self.email = email
+            self.connected = True
+            return True, None
+        except Exception as e:
+            self.last_error = _friendly_firebase_error(e)
+            self.connected = False
+            return False, self.last_error
+
+    def send_password_reset(self, email):
+        if not self._init_app():
+            return False, self.last_error
+        try:
+            self.auth.send_password_reset_email(email)
+            return True, None
+        except Exception as e:
+            self.last_error = _friendly_firebase_error(e)
+            return False, self.last_error
+
+    def sign_in_with_google(self, id_token):
+        """Exchanges a Google ID token (from _run_google_oauth_flow) for a
+        real Firebase session, via Firebase's accounts:signInWithIdp REST
+        endpoint. Returns (success, error)."""
+        if not self._init_app():
+            return False, self.last_error
+        if not REQUESTS_AVAILABLE:
+            return False, "The 'requests' package is required (pip install requests)."
+        api_key = self.config.get("apiKey", "")
+        try:
+            resp = requests.post(
+                f"{FIREBASE_SIGN_IN_WITH_IDP_ENDPOINT}?key={api_key}",
+                json={
+                    "postBody": f"id_token={id_token}&providerId=google.com",
+                    "requestUri": OAUTH_REDIRECT_URL,
+                    "returnIdpCredential": True,
+                    "returnSecureToken": True,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self.id_token = data["idToken"]
+            self.refresh_token = data.get("refreshToken")
+            self.uid = data["localId"]
+            self.email = data.get("email")
+            self.connected = True
+            return True, None
+        except Exception as e:
+            self.last_error = _friendly_firebase_error(e)
+            self.connected = False
+            return False, self.last_error
+
+    def refresh_session(self, refresh_token, email=None):
+        """Exchanges a saved refresh token for a fresh ID token, restoring a
+        signed-in session without re-entering credentials. Returns (success, error)."""
+        if not self._init_app():
+            return False, self.last_error
+        if not REQUESTS_AVAILABLE:
+            return False, "The 'requests' package is required (pip install requests)."
+        api_key = self.config.get("apiKey", "")
+        try:
+            resp = requests.post(
+                f"https://securetoken.googleapis.com/v1/token?key={api_key}",
+                data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self.id_token = data["id_token"]
+            self.refresh_token = data.get("refresh_token", refresh_token)
+            self.uid = data["user_id"]
+            self.email = email
+            self.connected = True
+            return True, None
+        except Exception as e:
+            self.last_error = _friendly_firebase_error(e)
+            self.connected = False
+            return False, self.last_error
+
+    def sign_out(self):
+        self.connected = False
+        self.id_token = None
+        self.refresh_token = None
+        self.uid = None
+        self.email = None
+
+    def _user_ref(self):
+        return self.db.child("users").child(self.uid)
 
     def fetch_all(self):
         """Returns (quizzes, drafts, subjects) or None on failure."""
         if not self.connected:
             return None
         try:
-            quizzes_raw = self.db.child("quizzes").get(self.id_token).val() or {}
-            drafts_raw = self.db.child("drafts").get(self.id_token).val() or {}
-            subjects_raw = self.db.child("subjects").get(self.id_token).val()
+            ref = self._user_ref()
+            quizzes_raw = ref.child("quizzes").get(self.id_token).val() or {}
+            drafts_raw = ref.child("drafts").get(self.id_token).val() or {}
+            subjects_raw = ref.child("subjects").get(self.id_token).val()
             quizzes = list(quizzes_raw.values()) if isinstance(quizzes_raw, dict) else []
             drafts = [dict(v, _key=k) for k, v in drafts_raw.items()] if isinstance(drafts_raw, dict) else []
             subjects = subjects_raw if isinstance(subjects_raw, list) else None
@@ -202,7 +533,7 @@ class CloudStore:
         if not self.connected:
             return
         try:
-            self.db.child("quizzes").child(quiz["id"]).set(quiz, self.id_token)
+            self._user_ref().child("quizzes").child(quiz["id"]).set(quiz, self.id_token)
         except Exception as e:
             self.last_error = str(e)
 
@@ -210,7 +541,7 @@ class CloudStore:
         if not self.connected:
             return
         try:
-            self.db.child("quizzes").child(quiz_id).remove(self.id_token)
+            self._user_ref().child("quizzes").child(quiz_id).remove(self.id_token)
         except Exception as e:
             self.last_error = str(e)
 
@@ -218,7 +549,7 @@ class CloudStore:
         if not self.connected:
             return
         try:
-            self.db.child("drafts").child(key).set(draft_payload, self.id_token)
+            self._user_ref().child("drafts").child(key).set(draft_payload, self.id_token)
         except Exception as e:
             self.last_error = str(e)
 
@@ -226,7 +557,7 @@ class CloudStore:
         if not self.connected:
             return
         try:
-            self.db.child("drafts").child(key).remove(self.id_token)
+            self._user_ref().child("drafts").child(key).remove(self.id_token)
         except Exception as e:
             self.last_error = str(e)
 
@@ -234,7 +565,7 @@ class CloudStore:
         if not self.connected:
             return
         try:
-            self.db.child("subjects").set(subjects, self.id_token)
+            self._user_ref().child("subjects").set(subjects, self.id_token)
         except Exception as e:
             self.last_error = str(e)
 
@@ -244,7 +575,7 @@ class CloudStore:
 # ══════════════════════════════════════════════════════════════════════════
 SAMPLE_QUIZZES = [
     {
-        "id": "BIO101", "code": "BIO101", "title": "Cellular Biology Midterm",
+        "id": "BIO101", "code": "BIO101", "title": "(Example) Cellular Biology Midterm",
         "subject": "Biology", "category": "Science",
         "description": "Covers cellular respiration, photosynthesis, organelle structures, and membrane transport fundamentals.",
         "difficulty": "Intermediate", "time_mins": 15, "edited": "Edited 2h ago",
@@ -268,54 +599,7 @@ SAMPLE_QUIZZES = [
              "correct_index": 0, "explanation": "Phospholipids form the foundational phospholipid bilayer of biological membranes."},
         ],
     },
-    {
-        "id": "MATH101", "code": "MATH101", "title": "Calculus Fundamentals 101",
-        "subject": "Mathematics", "category": "Mathematics",
-        "description": "Essential limits, derivatives, chain rules, and basic integral calculus applications.",
-        "difficulty": "Beginner", "time_mins": 10, "edited": "Edited 1d ago",
-        "badge_color": SECONDARY, "badge_bg": SECONDARY_LIGHT, "icon": "📐", "students_taken": 98,
-        "questions": [
-            {"question": "What is the derivative of f(x) = x³ - 4x + 7 with respect to x?",
-             "options": ["3x² - 4", "3x² + 4", "x² - 4", "3x³ - 4x"],
-             "correct_index": 0, "explanation": "Using the power rule: d/dx(x³) = 3x² and d/dx(-4x) = -4."},
-            {"question": "What is the limit of (sin x) / x as x approaches 0?",
-             "options": ["0", "1", "Infinity", "Undefined"],
-             "correct_index": 1, "explanation": "The fundamental trigonometric limit is 1."},
-            {"question": "What geometric property does the first derivative of a function represent at a point?",
-             "options": ["Area under the curve", "Slope of the tangent line", "Curvature of the graph", "Length of the arc"],
-             "correct_index": 1, "explanation": "The first derivative represents the instantaneous slope of the tangent line."},
-        ],
-    },
-    {
-        "id": "HIST101", "code": "HIST101", "title": "The Industrial Revolution: Key Events",
-        "subject": "History", "category": "History",
-        "description": "Explore the technological breakthroughs, social transformations, and economic shifts of the 18th-19th centuries.",
-        "difficulty": "Beginner", "time_mins": 10, "edited": "Edited 3d ago",
-        "badge_color": TERTIARY, "badge_bg": TERTIARY_LIGHT, "icon": "🏛️", "students_taken": 64,
-        "questions": [
-            {"question": "In which country did the Industrial Revolution initially begin in the mid-18th century?",
-             "options": ["France", "Great Britain", "Germany", "United States"],
-             "correct_index": 1, "explanation": "Britain had abundant coal, capital, and trade networks."},
-            {"question": "Which invention by James Watt greatly accelerated industrial mechanization?",
-             "options": ["Cotton Gin", "Improved Steam Engine", "Spinning Jenny", "Telegraph"],
-             "correct_index": 1, "explanation": "James Watt's steam engine provided reliable mechanized power."},
-        ],
-    },
-    {
-        "id": "CS202", "code": "CS202", "title": "Data Structures: Trees & Graphs",
-        "subject": "Computer Science", "category": "Computer Science",
-        "description": "Master traversal algorithms, binary search trees, graph representations, and algorithmic time complexity.",
-        "difficulty": "Advanced", "time_mins": 25, "edited": "Edited 5d ago",
-        "badge_color": PRIMARY, "badge_bg": PRIMARY_LIGHT, "icon": "💻", "students_taken": 115,
-        "questions": [
-            {"question": "What is the average time complexity for searching in a balanced Binary Search Tree (BST)?",
-             "options": ["O(1)", "O(log n)", "O(n)", "O(n log n)"],
-             "correct_index": 1, "explanation": "A balanced BST halves the search space at each level, taking O(log n) time."},
-            {"question": "Which graph traversal algorithm uses a First-In-First-Out (FIFO) queue?",
-             "options": ["Depth-First Search (DFS)", "Breadth-First Search (BFS)", "Dijkstra's with Stack", "Topological Sort with Recursion"],
-             "correct_index": 1, "explanation": "BFS explores vertices level by level using a FIFO queue."},
-        ],
-    },
+
 ]
 
 SAMPLE_DRAFTS = [
@@ -360,22 +644,30 @@ class ProfQuizzerApp:
         page.window.height = 860
         page.window.min_width = 340
 
-        # ---- Data (bundled defaults, overridden by local cache / cloud below) ----
-        self.quizzes = copy.deepcopy(SAMPLE_QUIZZES)
-        self.drafts = copy.deepcopy(SAMPLE_DRAFTS)
-        self.subjects = ["Science", "Biology", "Mathematics", "History",
-                          "Computer Science", "Literature", "General Knowledge"]
+        # ---- Configure Google OAuth Provider ----
+        self.auth_mode = "login"  # "login" or "signup"
 
-        # ---- Local cache (plain JSON file next to the script) — lets the app
-        # work offline and remember your data between launches, before Firebase
-        # even connects. Deliberately not using ft.SharedPreferences here: its
-        # API differs across Flet versions (sync vs async), so a plain file is
-        # more predictable and works the same everywhere.
-        self._load_local_cache()
+        # ---- Data — populated once a user is signed in ----
+        self.quizzes = []
+        self.drafts = []
+        self.subjects = [
+            "Science",
+            "Biology",
+            "Mathematics",
+            "History",
+            "Computer Science",
+            "Literature",
+            "General Knowledge",
+        ]
+        self.cache_file = None
 
-        # ---- Cloud sync (Firebase) — shared data between you and your friends ----
+        # ---- Cloud auth/sync (Firebase/Backend) ----
         self.cloud = CloudStore(FIREBASE_CONFIG)
-        self.current_route = "dashboard"
+        self.logged_in = False
+        self.user_email = None
+        self.user_name = None
+        self.auth_busy = False
+        self.current_route = "login"
 
         # ---- Session state ----
         self.current_quiz = None
@@ -405,19 +697,92 @@ class ProfQuizzerApp:
             ft.Column([self.body, self.bottom_nav], expand=True, spacing=0)
         )
 
+
+        # Start at login screen, then try to silently restore a saved
+        # session in the background (won't block the UI either way)
+        self.goto_login()
+        threading.Thread(target=self._try_auto_login, daemon=True).start()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Google OAuth Handlers
+    # ──────────────────────────────────────────────────────────────────
+    def login_with_google(self, e=None):
+        """Kicks off the manual Google OAuth flow (local callback server +
+        direct calls to Google/Firebase) in a background thread, so the UI
+        stays responsive while the user completes sign-in in their browser."""
+        if self.auth_busy:
+            return
+        self.auth_busy = True
+        self.page.update()
+        threading.Thread(target=self._google_login_worker, daemon=True).start()
+
+    def _try_auto_login(self):
+        """Runs once at startup: if a saved session exists on this device,
+        silently restore it instead of making the user log in again."""
+        session = _load_session()
+        if not session or not session.get("refresh_token"):
+            return
+        ok, err = self.cloud.refresh_session(session["refresh_token"], session.get("email"))
+        if not ok:
+            _clear_session()  # stale/expired/revoked — stop retrying it
+            return
+        self.logged_in = True
+        self.user_email = self.cloud.email or session.get("email")
+        self.user_name = (self.user_email or "User").split("@")[0]
+        _save_session(self.cloud.refresh_token, self.cloud.uid, self.user_email)
+        self._after_auth_success(self.user_email)
+
+    def _google_login_worker(self):
+        id_token, access_token, err = _run_google_oauth_flow(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
+        if err or not id_token:
+            self.auth_busy = False
+            self.toast(f"Google sign-in failed: {err or 'unknown error'}", bgcolor=ERROR)
+            self.page.update()
+            return
+
+        ok, fb_err = self.cloud.sign_in_with_google(id_token)
+        self.auth_busy = False
+        if not ok:
+            self.toast(f"Google sign-in failed: {fb_err}", bgcolor=ERROR)
+            self.page.update()
+            return
+
+        self.logged_in = True
+        self.user_email = self.cloud.email or "Google User"
+        self.user_name = self.user_email.split("@")[0]
+        _save_session(self.cloud.refresh_token, self.cloud.uid, self.user_email)
+        self._after_auth_success(self.user_email)
+        self.toast(f"Welcome, {self.user_email}!")
+
+    def _after_auth_success(self, email_or_uid):
+        """Post-login workflow: setup local cache, sync cloud, route to dashboard."""
+        self._load_local_cache_for_user(email_or_uid)
+        threading.Thread(target=self._sync_after_login, daemon=True).start()
         self.goto_dashboard()
 
-        # Connect to Firebase and sync in the background so app startup is
-        # never blocked waiting on the network.
-        threading.Thread(target=self._connect_and_sync, daemon=True).start()
+    # ──────────────────────────────────────────────────────────────────
+    # Persistence: local cache (per user) + cloud sync
+    # ──────────────────────────────────────────────────────────────────
+    def _load_local_cache_for_user(self, email_or_uid):
+        """Load this user's cached quizzes/drafts/subjects from disk, falling
 
-    # ──────────────────────────────────────────────────────────────────
-    # Persistence: local cache + cloud sync
-    # ──────────────────────────────────────────────────────────────────
-    def _load_local_cache(self):
+        back to the bundled sample data for a first-ever login.
+        """
+        self.cache_file = _cache_path_for(email_or_uid)
+        self.quizzes = copy.deepcopy(SAMPLE_QUIZZES)
+        self.drafts = copy.deepcopy(SAMPLE_DRAFTS)
+        self.subjects = [
+            "Science",
+            "Biology",
+            "Mathematics",
+            "History",
+            "Computer Science",
+            "Literature",
+            "General Knowledge",
+        ]
         try:
-            if CACHE_FILE.exists():
-                data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            if self.cache_file.exists():
+                data = json.loads(self.cache_file.read_text(encoding="utf-8"))
                 if data.get("quizzes"):
                     self.quizzes = data["quizzes"]
                 if data.get("drafts"):
@@ -428,35 +793,47 @@ class ProfQuizzerApp:
             print("Local cache unavailable, using bundled samples:", e)
 
     def _save_local_cache(self):
+        if not self.cache_file:
+            return
         try:
-            CACHE_FILE.write_text(
-                json.dumps({
-                    "quizzes": self.quizzes,
-                    "drafts": self.drafts,
-                    "subjects": self.subjects,
-                }, indent=2),
+            self.cache_file.write_text(
+                json.dumps(
+                    {
+                        "quizzes": self.quizzes,
+                        "drafts": self.drafts,
+                        "subjects": self.subjects,
+                    },
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
         except Exception as e:
             print("Could not write local cache:", e)
 
-    def _connect_and_sync(self):
-        self.cloud.connect()
-        if not self.cloud.connected:
-            print("Cloud sync unavailable:", self.cloud.last_error)
-            return
+    def _sync_after_login(self):
+        """Runs in a background thread right after a successful sign-in/up."""
         result = self.cloud.fetch_all()
         if not result:
+            print("Cloud sync unavailable:", _friendly_firebase_error(self.cloud.last_error or ""))
             return
         quizzes, drafts, subjects = result
-        if quizzes:
-            self.quizzes = quizzes
-        if drafts:
-            self.drafts = drafts
-        if subjects:
-            self.subjects = subjects
-        self._save_local_cache()
-        self._on_cloud_synced()
+        if quizzes or drafts or subjects:
+            if quizzes:
+                self.quizzes = quizzes
+            if drafts:
+                self.drafts = drafts
+            if subjects:
+                self.subjects = subjects
+            self._save_local_cache()
+            self._on_cloud_synced()
+        else:
+            for q in self.quizzes:
+                self.cloud.save_quiz(q)
+            for d in self.drafts:
+                key = d.get("_key") or slugify(d.get("title", "draft"))
+                payload = {k: v for k, v in d.items() if k != "_key"}
+                self.cloud.save_draft(payload, key)
+            self.cloud.save_subjects(list(self.subjects))
 
     def _on_cloud_synced(self):
         try:
@@ -653,12 +1030,26 @@ class ProfQuizzerApp:
         self.bottom_nav.update()
 
     def _show_profile(self):
-        self.dialog_info(
-            "Profile",
-            f"Quiz Master Instructor Account\nRole: Academic Professor\n"
-            f"Active Quizzes: {len(self.quizzes)}\n"
-            f"Total Students: {sum(q.get('students_taken', 0) for q in self.quizzes)}",
+        def _confirm_logout(e):
+            self.page.pop_dialog()
+            self.dialog_confirm("Log Out", "Are you sure you want to log out?", self._logout)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Profile", weight=ft.FontWeight.BOLD),
+            content=ft.Text(
+                f"Signed in as: {self.user_email}\n"
+                f"Active Quizzes: {len(self.quizzes)}\n"
+                f"Total Students: {sum(q.get('students_taken', 0) for q in self.quizzes)}"
+            ),
+            actions=[
+                ft.TextButton("Log Out", on_click=_confirm_logout,
+                              style=ft.ButtonStyle(color=ERROR)),
+                ft.TextButton("Close", on_click=lambda e: self.page.pop_dialog()),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
         )
+        self.page.show_dialog(dlg)
 
     def _set_body(self, control, show_nav=True, active_nav=None):
         self.body.content = control
@@ -666,6 +1057,328 @@ class ProfQuizzerApp:
         if active_nav is not None:
             self.active_nav = active_nav
         self.page.update()
+
+    # ══════════════════════════════════════════════════════════════════
+    # SCREEN 0: Login / Sign Up
+    # ══════════════════════════════════════════════════════════════════
+    def goto_login(self):
+        self.current_route = "login"
+        self._set_body(self.build_login(), show_nav=False)
+
+    def build_login(self):
+        is_signup = self.auth_mode == "signup"
+
+        logo = ft.Container(
+            content=ft.Text("📝", size=34),
+            width=76,
+            height=76,
+            bgcolor=PRIMARY_LIGHT,
+            border_radius=38,
+            alignment=ft.Alignment.CENTER,
+        )
+        title = ft.Text(
+            "Quiz Master",
+            size=24,
+            weight=ft.FontWeight.W_800,
+            color=PRIMARY,
+            text_align=ft.TextAlign.CENTER,
+        )
+        subtitle = ft.Text(
+            (
+                "Create an account to sync your quizzes"
+                if is_signup
+                else "Log in to access your quizzes"
+            ),
+            size=13,
+            color=TEXT_MUTED,
+            text_align=ft.TextAlign.CENTER,
+        )
+
+        self.login_email = ft.TextField(
+            label="Email",
+            value="",
+            height=48,
+            border_radius=12,
+            border_color=BORDER_COLOR,
+            color="black",
+            content_padding=ft.Padding.symmetric(horizontal=12),
+            autofocus=True,
+            keyboard_type=ft.KeyboardType.EMAIL,
+        )
+        self.login_password = ft.TextField(
+            label="Password",
+            password=True,
+            can_reveal_password=True,
+            height=48,
+            border_radius=12,
+            border_color=BORDER_COLOR,
+            color="black",
+            content_padding=ft.Padding.symmetric(horizontal=12),
+        )
+        fields = [
+            field_label("Email"),
+            self.login_email,
+            field_label("Password"),
+            self.login_password,
+        ]
+
+        if is_signup:
+            self.login_password_confirm = ft.TextField(
+                label="Confirm Password",
+                password=True,
+                can_reveal_password=True,
+                height=48,
+                border_radius=12,
+                border_color=BORDER_COLOR,
+                color="black",
+                content_padding=ft.Padding.symmetric(horizontal=12),
+            )
+            fields += [
+                field_label("Confirm Password"),
+                self.login_password_confirm,
+            ]
+        else:
+            forgot_btn = ft.TextButton(
+                "Forgot password?",
+                on_click=lambda e: self._handle_forgot_password(),
+                style=ft.ButtonStyle(color=PRIMARY),
+            )
+            fields.append(ft.Row([ft.Container(expand=True), forgot_btn]))
+
+        form_card = card(ft.Column(fields, spacing=8))
+
+        self.login_submit_text = ft.Text(
+            "Sign Up" if is_signup else "Log In",
+            size=15,
+            weight=ft.FontWeight.BOLD,
+            color="white",
+        )
+        submit_btn = ft.Container(
+            content=self.login_submit_text,
+            bgcolor=PRIMARY,
+            border_radius=14,
+            height=50,
+            alignment=ft.Alignment.CENTER,
+            ink=True,
+            on_click=lambda e: (
+                self._do_signup(e) if is_signup else self._do_login(e)
+            ),
+        )
+
+        # ---- Google OAuth Button & Divider ----
+        divider_row = ft.Row(
+            [
+                ft.Container(
+                    expand=True, height=1, bgcolor=BORDER_COLOR
+                ),
+                ft.Text("OR", size=11, color=TEXT_MUTED, weight=ft.FontWeight.W_600),
+                ft.Container(
+                    expand=True, height=1, bgcolor=BORDER_COLOR
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.CENTER,
+            spacing=10,
+        )
+
+        google_btn = ft.Container(
+            content=ft.Row(
+                [
+                    ft.Icon(
+                        ft.Icons.G_TRANSLATE, color=PRIMARY, size=20
+                    ),
+                    ft.Text(
+                        "Continue with Google",
+                        size=14,
+                        weight=ft.FontWeight.W_600,
+                        color="black",
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=10,
+            ),
+            bgcolor="white",
+            border=ft.Border(
+                top=ft.BorderSide(1, BORDER_COLOR),
+                bottom=ft.BorderSide(1, BORDER_COLOR),
+                left=ft.BorderSide(1, BORDER_COLOR),
+                right=ft.BorderSide(1, BORDER_COLOR),
+            ),
+            border_radius=14,
+            height=50,
+            alignment=ft.Alignment.CENTER,
+            ink=True,
+            on_click=self.login_with_google,
+        )
+
+        toggle_row = ft.Row(
+            [
+                ft.Text(
+                    (
+                        "Already have an account?"
+                        if is_signup
+                        else "Don't have an account?"
+                    ),
+                    size=12,
+                    color=TEXT_MUTED,
+                ),
+                ft.TextButton(
+                    "Log In" if is_signup else "Sign Up",
+                    on_click=lambda e: self._toggle_auth_mode(),
+                    style=ft.ButtonStyle(color=PRIMARY),
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.CENTER,
+            spacing=0,
+        )
+
+        offline_btn = ft.TextButton(
+            "Continue without an account (local only)",
+            on_click=lambda e: self._continue_offline(),
+            style=ft.ButtonStyle(color=TEXT_MUTED),
+        )
+
+        firebase_ready = (
+            PYREBASE_AVAILABLE
+            and not self.cloud.config.get("apiKey", "").startswith("YOUR_")
+        )
+        notice = None
+        if not firebase_ready:
+            notice = ft.Container(
+                content=ft.Text(
+                    "⚠ Firebase isn't configured yet — "
+                    "use 'Continue with Google' or 'Continue without an account' below.",
+                    size=11,
+                    color=TERTIARY,
+                    text_align=ft.TextAlign.CENTER,
+                ),
+                padding=ft.Padding.symmetric(horizontal=8),
+            )
+
+        content_controls = [
+            ft.Container(height=24),
+            logo,
+            title,
+            subtitle,
+            ft.Container(height=8),
+            form_card,
+            submit_btn,
+            divider_row,
+            google_btn,
+            toggle_row,
+        ]
+        if notice:
+            content_controls.append(notice)
+        content_controls.append(offline_btn)
+
+        content = ft.Container(
+            content=ft.Column(
+                controls=content_controls,
+                spacing=14,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=ft.Padding.symmetric(horizontal=28, vertical=16),
+            expand=True,
+        )
+        return ft.Column([content], expand=True, spacing=0)
+
+    def _toggle_auth_mode(self):
+        self.auth_mode = "login" if self.auth_mode == "signup" else "signup"
+        self._set_body(self.build_login(), show_nav=False)
+
+    def _set_login_loading(self, loading):
+        self.auth_busy = loading
+        try:
+            self.login_submit_text.value = "Please wait…" if loading else (
+                "Sign Up" if self.auth_mode == "signup" else "Log In"
+            )
+            self.login_submit_text.update()
+        except Exception:
+            pass
+
+    def _do_login(self, e):
+        if self.auth_busy:
+            return
+        email = (self.login_email.value or "").strip()
+        password = self.login_password.value or ""
+        if not email or not password:
+            self.dialog_info("Missing Info", "Please enter both your email and password.")
+            return
+        self._set_login_loading(True)
+        threading.Thread(target=self._login_worker, args=(email, password), daemon=True).start()
+
+    def _login_worker(self, email, password):
+        ok, err = self.cloud.sign_in(email, password)
+        self._after_auth_attempt(ok, err, email)
+
+    def _do_signup(self, e):
+        if self.auth_busy:
+            return
+        email = (self.login_email.value or "").strip()
+        password = self.login_password.value or ""
+        confirm = self.login_password_confirm.value or ""
+        if not email or not password:
+            self.dialog_info("Missing Info", "Please enter both your email and password.")
+            return
+        if len(password) < 6:
+            self.dialog_info("Weak Password", "Your password should be at least 6 characters.")
+            return
+        if password != confirm:
+            self.dialog_info("Password Mismatch", "Those passwords don't match. Please try again.")
+            return
+        self._set_login_loading(True)
+        threading.Thread(target=self._signup_worker, args=(email, password), daemon=True).start()
+
+    def _signup_worker(self, email, password):
+        ok, err = self.cloud.sign_up(email, password)
+        self._after_auth_attempt(ok, err, email)
+
+    def _after_auth_attempt(self, ok, err, email):
+        self._set_login_loading(False)
+        if not ok:
+            self.dialog_info("Sign-in Failed", err or "Something went wrong. Please try again.")
+            return
+        self.logged_in = True
+        self.user_email = email
+        _save_session(self.cloud.refresh_token, self.cloud.uid, email)
+        self._load_local_cache_for_user(email)
+
+    def _handle_forgot_password(self):
+        email = (self.login_email.value or "").strip()
+        if not email:
+            self.dialog_info("Enter Your Email", "Type your email above first, then tap 'Forgot password?' again.")
+            return
+
+        def worker():
+            ok, err = self.cloud.send_password_reset(email)
+            if ok:
+                self.dialog_info("Check Your Inbox", f"A password reset link has been sent to {email}.")
+            else:
+                self.dialog_info("Couldn't Send Reset Email", err or "Please try again later.")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _continue_offline(self):
+        """Skip real authentication entirely — local-only guest mode, mainly
+        for trying the app out or when Firebase isn't configured."""
+        self.logged_in = True
+        self.user_email = "Guest (local only)"
+        self._load_local_cache_for_user("guest")
+        self.goto_dashboard()
+        self.toast("Using local storage only — no cloud sync in guest mode.", bgcolor=TERTIARY)
+
+    def _logout(self):
+        self.timer_running = False
+        self.cloud.sign_out()
+        _clear_session()
+        self.logged_in = False
+        self.user_email = None
+        self.quizzes = []
+        self.drafts = []
+        self.current_quiz = None
+        self.cache_file = None
+        self.auth_mode = "login"
+        self.goto_login()
 
     # ══════════════════════════════════════════════════════════════════
     # SCREEN 1: Dashboard
@@ -732,7 +1445,7 @@ class ProfQuizzerApp:
         )
 
         fab = ft.Container(
-            content=ft.Text("+", size=30, color="white", weight=ft.FontWeight.W_300),
+            content=ft.Icon(ft.Icons.ADD, color="white", size=28),
             width=54, height=54, bgcolor=PRIMARY, border_radius=27,
             alignment=ft.Alignment.CENTER, shadow=CARD_SHADOW, ink=True,
             on_click=lambda e: self.goto_create_setup(),
@@ -904,7 +1617,7 @@ class ProfQuizzerApp:
         )
 
         fab = ft.Container(
-            content=ft.Text("+", size=30, color="white", weight=ft.FontWeight.W_300),
+            content=ft.Icon(ft.Icons.ADD, color="white", size=28),
             width=54, height=54, bgcolor=PRIMARY, border_radius=27,
             alignment=ft.Alignment.CENTER, shadow=CARD_SHADOW, ink=True,
             on_click=lambda e: self.goto_create_setup(),
@@ -1929,4 +2642,4 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.run(main)
+    ft.app(target=main, port=8550)
