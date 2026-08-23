@@ -83,30 +83,83 @@ def _clear_session():
     except Exception as e:
         print("Could not clear session:", e)
 
-# ══════════════════════════════════════════════════════════════════════════
-# Academic Clarity Design System Tokens
-# ══════════════════════════════════════════════════════════════════════════
 
-BG_APP = "#f8f9ff"
-BG_SURFACE = "#ffffff"
-SURFACE_LOW = "#eff4ff"
-SURFACE_MID = "#e5eeff"
-SURFACE_HIGH = "#dce9ff"
-PRIMARY = "#00685f"
-PRIMARY_CONTAINER = "#008378"
-PRIMARY_LIGHT = "#e6f5f3"
-SECONDARY = "#4648d4"
-SECONDARY_LIGHT = "#eef0ff"
-TERTIARY = "#a35532"
-TERTIARY_LIGHT = "#fff0eb"
-TEXT_ON_SURFACE = "#0b1c30"
-TEXT_MUTED = "#6d7a77"
-TEXT_VARIANT = "#2d3a4b"
-BORDER_COLOR = "#e2e8f0"
-SUCCESS = "#00875a"
-SUCCESS_CONTAINER = "#e6f8ef"
-ERROR = "#ba1a1a"
-ERROR_CONTAINER = "#ffdad6"
+SETTINGS_FILE = CACHE_DIR / "quiz_master_settings.json"
+
+
+def _load_settings():
+    """Local, per-device app preferences (dark mode, question order, etc.)."""
+    try:
+        if SETTINGS_FILE.exists():
+            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        print("Could not load settings:", e)
+    return {}
+
+
+def _save_settings(settings):
+    try:
+        SETTINGS_FILE.write_text(json.dumps(settings), encoding="utf-8")
+    except Exception as e:
+        print("Could not save settings:", e)
+
+# ══════════════════════════════════════════════════════════════════════════
+# Academic Clarity Design System Tokens — Light & Dark
+# ══════════════════════════════════════════════════════════════════════════
+# Every screen builder below reads these names (BG_APP, PRIMARY, ...) as
+# plain module globals, freshly, every time it runs. _apply_theme() swaps
+# them all in one shot, so calling any build_*() again after a toggle
+# automatically renders in the new theme.
+
+LIGHT_THEME = {
+    "BG_APP": "#f8f9ff", "BG_SURFACE": "#ffffff", "SURFACE_LOW": "#eff4ff",
+    "SURFACE_MID": "#e5eeff", "SURFACE_HIGH": "#dce9ff", "PRIMARY": "#00685f",
+    "PRIMARY_CONTAINER": "#008378", "PRIMARY_LIGHT": "#e6f5f3",
+    "SECONDARY": "#4648d4", "SECONDARY_LIGHT": "#eef0ff",
+    "TERTIARY": "#a35532", "TERTIARY_LIGHT": "#fff0eb",
+    "TEXT_ON_SURFACE": "#0b1c30", "TEXT_MUTED": "#6d7a77", "TEXT_VARIANT": "#2d3a4b",
+    "BORDER_COLOR": "#e2e8f0", "SUCCESS": "#00875a", "SUCCESS_CONTAINER": "#e6f8ef",
+    "ERROR": "#ba1a1a", "ERROR_CONTAINER": "#ffdad6", "INPUT_TEXT_COLOR": "black",
+}
+
+DARK_THEME = {
+    "BG_APP": "#0e1414", "BG_SURFACE": "#161f1f", "SURFACE_LOW": "#1c2727",
+    "SURFACE_MID": "#212e2e", "SURFACE_HIGH": "#283939", "PRIMARY": "#4a9c8f",
+    "PRIMARY_CONTAINER": "#3a7d72", "PRIMARY_LIGHT": "#1a2b28",
+    "SECONDARY": "#9a9cff", "SECONDARY_LIGHT": "#242548",
+    "TERTIARY": "#e5966b", "TERTIARY_LIGHT": "#3a2a20",
+    "TEXT_ON_SURFACE": "#eef2f2", "TEXT_MUTED": "#9fb0ac", "TEXT_VARIANT": "#c7d0d0",
+    "BORDER_COLOR": "#2c3a3a", "SUCCESS": "#5fd39a", "SUCCESS_CONTAINER": "#173229",
+    "ERROR": "#ff8b80", "ERROR_CONTAINER": "#3a1613", "INPUT_TEXT_COLOR": "white",
+}
+
+BG_APP = LIGHT_THEME["BG_APP"]
+BG_SURFACE = LIGHT_THEME["BG_SURFACE"]
+SURFACE_LOW = LIGHT_THEME["SURFACE_LOW"]
+SURFACE_MID = LIGHT_THEME["SURFACE_MID"]
+SURFACE_HIGH = LIGHT_THEME["SURFACE_HIGH"]
+PRIMARY = LIGHT_THEME["PRIMARY"]
+PRIMARY_CONTAINER = LIGHT_THEME["PRIMARY_CONTAINER"]
+PRIMARY_LIGHT = LIGHT_THEME["PRIMARY_LIGHT"]
+SECONDARY = LIGHT_THEME["SECONDARY"]
+SECONDARY_LIGHT = LIGHT_THEME["SECONDARY_LIGHT"]
+TERTIARY = LIGHT_THEME["TERTIARY"]
+TERTIARY_LIGHT = LIGHT_THEME["TERTIARY_LIGHT"]
+TEXT_ON_SURFACE = LIGHT_THEME["TEXT_ON_SURFACE"]
+TEXT_MUTED = LIGHT_THEME["TEXT_MUTED"]
+TEXT_VARIANT = LIGHT_THEME["TEXT_VARIANT"]
+BORDER_COLOR = LIGHT_THEME["BORDER_COLOR"]
+SUCCESS = LIGHT_THEME["SUCCESS"]
+SUCCESS_CONTAINER = LIGHT_THEME["SUCCESS_CONTAINER"]
+ERROR = LIGHT_THEME["ERROR"]
+ERROR_CONTAINER = LIGHT_THEME["ERROR_CONTAINER"]
+INPUT_TEXT_COLOR = LIGHT_THEME["INPUT_TEXT_COLOR"]
+
+
+def _apply_theme(dark: bool):
+    """Reassigns every color token above, in place, as module globals."""
+    globals().update(DARK_THEME if dark else LIGHT_THEME)
+
 
 FONT_FAMILY = "Segoe UI"
 LETTERS = ["A", "B", "C", "D", "E", "F"]
@@ -116,9 +169,15 @@ CARD_SHADOW = ft.BoxShadow(
 )
 
 
-def card(content, padding=16, radius=16, bgcolor=BG_SURFACE,
-         border_color=BORDER_COLOR, shadow=True):
-    """A bordered, softly-shadowed surface container — the workhorse of the UI."""
+def card(content, padding=16, radius=16, bgcolor=None,
+         border_color=None, shadow=True):
+    """A bordered, softly-shadowed surface container — the workhorse of the UI.
+    bgcolor/border_color default to the CURRENT theme's colors, resolved at
+    call time, so cards repaint correctly after a dark/light mode toggle."""
+    if bgcolor is None:
+        bgcolor = BG_SURFACE
+    if border_color is None:
+        border_color = BORDER_COLOR
     return ft.Container(
         content=content,
         padding=padding,
@@ -579,7 +638,7 @@ SAMPLE_QUIZZES = [
         "subject": "Biology", "category": "Science",
         "description": "Covers cellular respiration, photosynthesis, organelle structures, and membrane transport fundamentals.",
         "difficulty": "Intermediate", "time_mins": 15, "edited": "Edited 2h ago",
-        "badge_color": PRIMARY, "badge_bg": PRIMARY_LIGHT, "icon": "🔬", "students_taken": 142,
+        "badge_color": PRIMARY, "badge_bg": PRIMARY_LIGHT, "icon": "🔬", "students_taken": 67,
         "questions": [
             {"question": "What is the primary function of mitochondria in a eukaryotic cell?",
              "options": ["Protein synthesis and modification", "Cellular respiration and ATP energy production",
@@ -602,39 +661,19 @@ SAMPLE_QUIZZES = [
 
 ]
 
-SAMPLE_DRAFTS = [
-    {
-        "title": "World History Quiz", "subject": "History",
-        "description": "Key revolutions and geopolitical treaties of the early modern era.",
-        "difficulty": "Medium", "time_mins": 15, "icon": "📄",
-        "questions": [
-            {"question": "Which historic treaty concluded the Thirty Years' War in 1648?",
-             "options": ["Peace of Westphalia", "Treaty of Versailles", "Treaty of Utrecht", "Congress of Vienna"],
-             "correct_index": 0, "explanation": "The Peace of Westphalia established the concept of state sovereignty."},
-            {"question": "In what year did the French Revolution officially begin with the storming of the Bastille?",
-             "options": ["1776", "1789", "1804", "1815"],
-             "correct_index": 1, "explanation": "The storming of the Bastille took place on July 14, 1789."},
-        ],
-    },
-    {
-        "title": "Physics Lab Safety", "subject": "Science",
-        "description": "Essential laboratory safety protocols and emergency guidelines.",
-        "difficulty": "Easy", "time_mins": 10, "icon": "📄",
-        "questions": [
-            {"question": "What is the very first action you should take in case of a chemical spill in the laboratory?",
-             "options": ["Immediately notify the instructor", "Try to clean it up with paper towels", "Leave the building", "Pour water on it"],
-             "correct_index": 0, "explanation": "Always notify the instructor immediately before taking action."},
-        ],
-    },
-]
-
-
 # ══════════════════════════════════════════════════════════════════════════
 # Main App
 # ══════════════════════════════════════════════════════════════════════════
 class ProfQuizzerApp:
     def __init__(self, page: ft.Page):
         self.page = page
+
+        # ---- App preferences (dark mode, question order, ...) ----
+        settings = _load_settings()
+        self.dark_mode = bool(settings.get("dark_mode", False))
+        self.randomize_questions = bool(settings.get("randomize_questions", False))
+        _apply_theme(self.dark_mode)
+
         page.title = "Quiz Master"
         page.bgcolor = BG_APP
         page.padding = 0
@@ -770,7 +809,6 @@ class ProfQuizzerApp:
         """
         self.cache_file = _cache_path_for(email_or_uid)
         self.quizzes = copy.deepcopy(SAMPLE_QUIZZES)
-        self.drafts = copy.deepcopy(SAMPLE_DRAFTS)
         self.subjects = [
             "Science",
             "Biology",
@@ -855,7 +893,98 @@ class ProfQuizzerApp:
             "questions": [],
         }
 
-    def toast(self, message, bgcolor=PRIMARY):
+    # ──────────────────────────────────────────────────────────────────
+    # Settings (dark mode, question order, ...)
+    # ──────────────────────────────────────────────────────────────────
+    def _persist_settings(self):
+        _save_settings({
+            "dark_mode": self.dark_mode,
+            "randomize_questions": self.randomize_questions,
+        })
+
+    def _toggle_dark_mode(self, e):
+        self.dark_mode = e.control.value
+        _apply_theme(self.dark_mode)
+        self._persist_settings()
+        self._refresh_theme()
+
+    def _toggle_randomize(self, e):
+        self.randomize_questions = e.control.value
+        self._persist_settings()
+
+    def _refresh_theme(self):
+        """Repaints everything already on screen after a theme change: the
+        page background, the bottom nav (built once at startup, so it needs
+        an explicit repaint), and whatever screen is currently shown."""
+        self.page.bgcolor = BG_APP
+        self._rebuild_bottom_nav_colors()
+        if self.current_route == "dashboard":
+            self._set_body(self.build_dashboard(), active_nav=0)
+        elif self.current_route == "library":
+            self._set_body(self.build_library(), active_nav=1)
+        elif self.current_route == "settings":
+            self._set_body(self.build_settings(), show_nav=True, active_nav=2)
+        elif self.current_route == "login":
+            self._set_body(self.build_login(), show_nav=False)
+        else:
+            self.page.update()
+
+    def _rebuild_bottom_nav_colors(self):
+        self.nav_home_btn = self._nav_button("🏠", "Home", 0, self.goto_dashboard)
+        self.nav_lib_btn = self._nav_button("📚", "Library", 1, self.goto_library)
+        self.nav_prof_btn = self._nav_button("⚙", "Settings", 2, self.goto_settings)
+        self.bottom_nav.content = ft.Row(
+            [self.nav_home_btn, self.nav_lib_btn, self.nav_prof_btn], spacing=12,
+        )
+        self.bottom_nav.bgcolor = BG_SURFACE
+        self.bottom_nav.border = ft.Border.only(top=ft.BorderSide(1, BORDER_COLOR))
+        self.bottom_nav.update()
+
+    def goto_settings(self):
+        self.current_route = "settings"
+        self._set_body(self.build_settings(), show_nav=True, active_nav=2)
+        self._refresh_bottom_nav()
+
+    def build_settings(self):
+        header = self.build_header("Settings", subtitle="App preferences",
+                                    show_back=True, on_back=self.goto_dashboard)
+
+        dark_row = ft.Row([
+            ft.Column([
+                ft.Text("Dark Mode", size=14, weight=ft.FontWeight.W_800, color=TEXT_ON_SURFACE),
+                ft.Text("Switch the whole app to a dark color theme.", size=11, color=TEXT_MUTED),
+            ], spacing=2, expand=True),
+            ft.Switch(value=self.dark_mode, on_change=self._toggle_dark_mode),
+        ], vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+        random_row = ft.Row([
+            ft.Column([
+                ft.Text("Shuffle Questions", size=14, weight=ft.FontWeight.W_800, color=TEXT_ON_SURFACE),
+                ft.Text("Show quiz questions in random order instead of creation order.",
+                        size=11, color=TEXT_MUTED),
+            ], spacing=2, expand=True),
+            ft.Switch(value=self.randomize_questions, on_change=self._toggle_randomize),
+        ], vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+        settings_card = card(ft.Column([
+            ft.Text("Appearance & Quiz Behavior", size=15, weight=ft.FontWeight.W_800, color=PRIMARY),
+            dark_row,
+            ft.Container(height=1, bgcolor=BORDER_COLOR),
+            random_row,
+        ], spacing=14))
+
+        more_note = ft.Text("More settings will be added here soon.", size=11,
+                             italic=True, color=TEXT_MUTED, text_align=ft.TextAlign.CENTER)
+
+        content = ft.ListView(
+            controls=[settings_card, more_note],
+            spacing=16, padding=ft.Padding.symmetric(horizontal=20, vertical=16), expand=True,
+        )
+        return ft.Column([header, content], expand=True, spacing=0)
+
+    def toast(self, message, bgcolor=None):
+        if bgcolor is None:
+            bgcolor = PRIMARY
         self.page.overlay.append(
             ft.SnackBar(content=ft.Text(message, color="white"), bgcolor=bgcolor, open=True)
         )
@@ -971,7 +1100,7 @@ class ProfQuizzerApp:
                         bgcolor=PRIMARY,
                         radius=16,
                     ),
-                    on_click=lambda e: self.toast("Profile clicked"),
+                    on_click=lambda e: self._show_profile(),
                 ),
             ],
             spacing=8,
@@ -994,7 +1123,7 @@ class ProfQuizzerApp:
     def _build_bottom_nav(self):
         self.nav_home_btn = self._nav_button("🏠", "Home", 0, self.goto_dashboard)
         self.nav_lib_btn = self._nav_button("📚", "Library", 1, self.goto_library)
-        self.nav_prof_btn = self._nav_button("👤", "Profile", 2, self._show_profile)
+        self.nav_prof_btn = self._nav_button("⚙", "Settings", 2, self.goto_settings)
         row = ft.Row(
             [self.nav_home_btn, self.nav_lib_btn, self.nav_prof_btn],
             spacing=12,
@@ -1100,7 +1229,7 @@ class ProfQuizzerApp:
             height=48,
             border_radius=12,
             border_color=BORDER_COLOR,
-            color="black",
+            color=INPUT_TEXT_COLOR,
             content_padding=ft.Padding.symmetric(horizontal=12),
             autofocus=True,
             keyboard_type=ft.KeyboardType.EMAIL,
@@ -1112,7 +1241,7 @@ class ProfQuizzerApp:
             height=48,
             border_radius=12,
             border_color=BORDER_COLOR,
-            color="black",
+            color=INPUT_TEXT_COLOR,
             content_padding=ft.Padding.symmetric(horizontal=12),
         )
         fields = [
@@ -1130,7 +1259,7 @@ class ProfQuizzerApp:
                 height=48,
                 border_radius=12,
                 border_color=BORDER_COLOR,
-                color="black",
+                color=INPUT_TEXT_COLOR,
                 content_padding=ft.Padding.symmetric(horizontal=12),
             )
             fields += [
@@ -1343,6 +1472,9 @@ class ProfQuizzerApp:
         self.user_email = email
         _save_session(self.cloud.refresh_token, self.cloud.uid, email)
         self._load_local_cache_for_user(email)
+        self.goto_dashboard()
+        self.toast(f"Welcome, {email}!")
+        threading.Thread(target=self._sync_after_login, daemon=True).start()
 
     def _handle_forgot_password(self):
         email = (self.login_email.value or "").strip()
@@ -1392,7 +1524,7 @@ class ProfQuizzerApp:
             ft.Column([
                 ft.Row([ft.Text(icon, size=22), ft.Container(expand=True),
                         ft.Text(value, size=24, weight=ft.FontWeight.W_800, color=color)]),
-                ft.Text(label, size=10, weight=ft.FontWeight.W_800, color='black'),
+                ft.Text(label, size=10, weight=ft.FontWeight.W_800, color=TEXT_ON_SURFACE),
             ], spacing=6),
             padding=ft.Padding.symmetric(horizontal=16, vertical=14),
         )
@@ -1400,22 +1532,11 @@ class ProfQuizzerApp:
     def build_dashboard(self):
         header = self.build_header("Quiz Master")
 
-        search_field = ft.TextField(
+        search_row = ft.TextField(
             hint_text="🔍  Search quizzes by title or topic...", value=self.dash_search_text,
             height=46, border_radius=14, border_color=BORDER_COLOR, bgcolor=BG_SURFACE,
-            content_padding=ft.Padding.only(left=14), text_size=13, text_style=ft.TextStyle(color="black"),
+            content_padding=ft.Padding.only(left=14), text_size=13, text_style=ft.TextStyle(color=INPUT_TEXT_COLOR),
             on_change=self._on_dash_search,
-        )
-        search_row = ft.Row(
-            [
-                ft.Container(content=search_field, expand=True),
-                ft.Container(
-                    content=ft.Text("⚙", size=18, color=PRIMARY), width=46, height=46,
-                    bgcolor=SURFACE_LOW, border=ft.Border.all(1, BORDER_COLOR), border_radius=14,
-                    alignment=ft.Alignment.CENTER, on_click=lambda e: self.goto_library(), ink=True,
-                ),
-            ],
-            spacing=8,
         )
 
         stats_row = ft.Row(
@@ -1430,7 +1551,7 @@ class ProfQuizzerApp:
         stats_row.controls[1].expand = True
 
         active_header = ft.Row([
-            ft.Text("Active Quizzes", size=17, weight=ft.FontWeight.W_800, color="black"),
+            ft.Text("Active Quizzes", size=17, weight=ft.FontWeight.W_800, color=TEXT_ON_SURFACE),
             ft.Container(expand=True),
             ft.TextButton("View All", on_click=lambda e: self.goto_library(),
                           style=ft.ButtonStyle(color=PRIMARY)),
@@ -1438,7 +1559,7 @@ class ProfQuizzerApp:
 
         self.quiz_cards_container = ft.Column(self._get_quiz_card_controls(), spacing=12)
 
-        drafts_header = ft.Text("Recent Drafts", size=17, color="black", weight=ft.FontWeight.W_800)
+        drafts_header = ft.Text("Recent Drafts", size=17, color=TEXT_ON_SURFACE, weight=ft.FontWeight.W_800)
         drafts_row = ft.Row(
             [self._draft_card(d) for d in self.drafts] + [self._add_draft_card()],
             spacing=10, scroll=ft.ScrollMode.AUTO,
@@ -1476,7 +1597,7 @@ class ProfQuizzerApp:
         filtered = self._filtered_dash_quizzes()
         if filtered:
             return [self._dashboard_quiz_card(q) for q in filtered]
-        return [ft.Text("No active quizzes match your search.", color='TEXT_MUTED', size=13)]
+        return [ft.Text("No active quizzes match your search.", color=TEXT_MUTED, size=13)]
 
     def _on_dash_search(self, e):
         self.dash_search_text = e.control.value or ""
@@ -1590,10 +1711,10 @@ class ProfQuizzerApp:
         self.code_input = ft.TextField(
             hint_text="Enter Quiz Code (e.g. BIO101, MATH101)", height=44,
             border_radius=12, bgcolor=SURFACE_LOW, border_color=BORDER_COLOR,
-            content_padding=ft.Padding.only(left=12), text_size=13, text_style=ft.TextStyle(color="black"),
+            content_padding=ft.Padding.only(left=12), text_size=13, text_style=ft.TextStyle(color=INPUT_TEXT_COLOR),
         )
         join_card = card(ft.Column([
-            ft.Text("Join Live Session", size=15, weight=ft.FontWeight.W_800),
+            ft.Text("Join Live Session", size=15, weight=ft.FontWeight.W_800, color=TEXT_ON_SURFACE),
             ft.Row([
                 ft.Container(content=self.code_input, expand=True),
                 ft.Container(
@@ -1608,7 +1729,7 @@ class ProfQuizzerApp:
         search_field = ft.TextField(
             hint_text="🔍  Search topics, subjects...", value=self.lib_search_text,
             height=42, border_radius=12, border_color=BORDER_COLOR, bgcolor=BG_SURFACE,
-            content_padding=ft.Padding.only(left=12), text_size=13, text_style=ft.TextStyle(color="black"),
+            content_padding=ft.Padding.only(left=12), text_size=13, text_style=ft.TextStyle(color=INPUT_TEXT_COLOR),
             on_change=self._on_lib_search,
         )
 
@@ -1774,31 +1895,28 @@ class ProfQuizzerApp:
                                     show_back=True, on_back=self.goto_dashboard)
         progress = ft.ProgressBar(value=0.33, height=4, color=PRIMARY, bgcolor=SURFACE_LOW)
 
-        # Added color="black"
         self.input_new_title = ft.TextField(
             value=self.new_quiz_data.get("title", ""), hint_text="e.g. Introduction to Organic Chemistry",
             height=44, border_radius=12, border_color=BORDER_COLOR, content_padding=ft.Padding.only(left=12),
-            color="black",
+            color=INPUT_TEXT_COLOR,
         )
 
-        # Added color="black"
         self.combo_subject = ft.Dropdown(
             value=self.new_quiz_data.get("subject", "Science"),
             options=[ft.dropdown.Option(s) for s in self.subjects],
             height=44, border_radius=12, border_color=BORDER_COLOR,
-            color="black",
+            color=INPUT_TEXT_COLOR,
         )
         add_custom_btn = ft.TextButton(
             "+ Type Custom Subject", on_click=lambda e: self._prompt_add_subject_inline(),
             style=ft.ButtonStyle(color=PRIMARY),
         )
 
-        # Added color="black"
         self.input_new_desc = ft.TextField(
             value=self.new_quiz_data.get("description", ""),
             hint_text="Briefly describe what this quiz covers and instructions for students...",
             multiline=True, min_lines=3, max_lines=4, border_radius=12, border_color=BORDER_COLOR,
-            color="black",
+            color=INPUT_TEXT_COLOR,
         )
 
         basics_card = card(ft.Column([
@@ -1842,12 +1960,11 @@ class ProfQuizzerApp:
             self.diff_buttons[d] = btn
             diff_row.append(btn)
 
-        # Added color="black"
         self.input_new_time = ft.TextField(
             value=str(self.new_quiz_data.get("time_mins", 15)), height=44,
             border_radius=12, border_color=BORDER_COLOR, content_padding=ft.Padding.only(left=12),
             keyboard_type=ft.KeyboardType.NUMBER,
-            color="black",
+            color=INPUT_TEXT_COLOR,
         )
 
         settings_card = card(ft.Column([
@@ -1944,10 +2061,9 @@ class ProfQuizzerApp:
             else "+ Add New Question", size=15, weight=ft.FontWeight.W_800, color=PRIMARY,
         )
 
-        # Added color="black"
         self.input_question_text = ft.TextField(
             hint_text="Type question prompt here...", multiline=True, min_lines=3, max_lines=4,
-            border_radius=12, border_color=BORDER_COLOR, color="black",
+            border_radius=12, border_color=BORDER_COLOR, color=INPUT_TEXT_COLOR,
         )
         q_card = card(ft.Column([field_label("Question Prompt"), self.input_question_text], spacing=8))
 
@@ -1961,10 +2077,9 @@ class ProfQuizzerApp:
                 content=ft.Text(f" {LETTERS[i]} ", size=12, weight=ft.FontWeight.W_800, color=PRIMARY),
                 bgcolor=SURFACE_LOW, border_radius=6, padding=ft.Padding.symmetric(horizontal=6, vertical=4),
             )
-            # Added color="black"
             opt_edit = ft.TextField(hint_text=f"Option {LETTERS[i]} text...", height=40,
                                      border_radius=10, border_color=BORDER_COLOR,
-                                     content_padding=ft.Padding.only(left=12), expand=True, color="black")
+                                     content_padding=ft.Padding.only(left=12), expand=True, color=INPUT_TEXT_COLOR)
             self.opt_inputs.append(opt_edit)
             self.opt_tags.append(tag)
             row = ft.Container(
@@ -2310,8 +2425,7 @@ class ProfQuizzerApp:
                 content=ft.Text(q.get("icon", "📝"), size=32), width=70, height=70,
                 bgcolor=SURFACE_LOW, border_radius=35, alignment=ft.Alignment.CENTER,
             ),
-            # Added color="black"
-            ft.Text(q["title"], size=20, weight=ft.FontWeight.W_800, color="black", text_align=ft.TextAlign.CENTER),
+            ft.Text(q["title"], size=20, weight=ft.FontWeight.W_800, color=TEXT_ON_SURFACE, text_align=ft.TextAlign.CENTER),
             ft.Text(q.get("description", "Comprehensive academic quiz."), size=13, color=TEXT_VARIANT,
                     text_align=ft.TextAlign.CENTER),
             ft.Container(
@@ -2320,8 +2434,8 @@ class ProfQuizzerApp:
                     ft.Text(f"📋  {len(q['questions'])} Questions  ·  Multiple Choice", size=12,
                             weight=ft.FontWeight.W_800, color=PRIMARY),
                     ft.Text(f"⏱  {q.get('time_mins', 15)} Minutes  ·  Timed Assessment", size=12,
-                            weight=ft.FontWeight.W_600),
-                    ft.Text(f"📊  {q.get('difficulty', 'Intermediate')} Level", size=12, weight=ft.FontWeight.W_600),
+                            weight=ft.FontWeight.W_600, color=PRIMARY),
+                    ft.Text(f"📊  {q.get('difficulty', 'Intermediate')} Level", size=12, weight=ft.FontWeight.W_600, color=PRIMARY),
                 ], spacing=8),
             ),
             ft.Container(
@@ -2342,6 +2456,12 @@ class ProfQuizzerApp:
         if not self.current_quiz or not self.current_quiz.get("questions"):
             self.dialog_info("Empty Quiz", "This quiz has no questions.")
             return
+        if self.randomize_questions:
+            # Shuffle a COPY for this attempt only — never mutates the
+            # saved quiz, so the editor's question order stays intact.
+            shuffled = list(self.current_quiz["questions"])
+            random.shuffle(shuffled)
+            self.current_quiz = dict(self.current_quiz, questions=shuffled)
         self.quiz_question_idx = 0
         self.user_answers = [None] * len(self.current_quiz["questions"])
         self.quiz_total_seconds = self.current_quiz.get("time_mins", 15) * 60
@@ -2642,4 +2762,4 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.app(target=main, port=8550)
+    ft.run(main, port=8550)
