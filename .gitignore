@@ -3,6 +3,7 @@ firebase_config.py
 
 # Local data cache (your quizzes/drafts) — personal, not shared code.
 # Named per-account, e.g. quiz_master_cache_someone_gmail_com.json
+quiz_master_settings.json
 quiz_master_cache.json
 quiz_master_cache_*.json
 

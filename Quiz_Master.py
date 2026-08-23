@@ -1096,7 +1096,7 @@ class ProfQuizzerApp:
                 ),
                 ft.Container(
                     content=ft.CircleAvatar(
-                        content=ft.Text("PQ", size=12, weight=ft.FontWeight.BOLD, color="white"),
+                        content=ft.Text("P", size=12, weight=ft.FontWeight.BOLD, color="white"),
                         bgcolor=PRIMARY,
                         radius=16,
                     ),
