@@ -212,12 +212,20 @@ def kebab_menu(items):
     )
 
 
-def hex_to_light_bg(hex_color, blend=0.85):
+def hex_to_light_bg(hex_color, blend=0.85, dark=False):
     h = hex_color.lstrip("#")
+    if len(h) < 6:
+        return hex_color
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    lr = int(r + (255 - r) * blend)
-    lg = int(g + (255 - g) * blend)
-    lb = int(b + (255 - b) * blend)
+    if dark:
+        base_r, base_g, base_b = 22, 31, 31
+        lr = int(r * 0.22 + base_r * 0.78)
+        lg = int(g * 0.22 + base_g * 0.78)
+        lb = int(b * 0.22 + base_b * 0.78)
+    else:
+        lr = int(r + (255 - r) * blend)
+        lg = int(g + (255 - g) * blend)
+        lb = int(b + (255 - b) * blend)
     return f"#{lr:02x}{lg:02x}{lb:02x}"
 
 
@@ -568,18 +576,18 @@ class CloudStore:
         self.uid = None
         self.email = None
 
-    def _user_ref(self):
-        return self.db.child("users").child(self.uid)
+    def _user_path(self, *subpaths):
+        parts = ["users", self.uid] + list(subpaths)
+        return "/".join(str(p) for p in parts if p is not None)
 
     def fetch_all(self):
         """Returns (quizzes, drafts, subjects) or None on failure."""
-        if not self.connected:
+        if not self.connected or not self.uid:
             return None
         try:
-            ref = self._user_ref()
-            quizzes_raw = ref.child("quizzes").get(self.id_token).val() or {}
-            drafts_raw = ref.child("drafts").get(self.id_token).val() or {}
-            subjects_raw = ref.child("subjects").get(self.id_token).val()
+            quizzes_raw = self.db.child(self._user_path("quizzes")).get(self.id_token).val() or {}
+            drafts_raw = self.db.child(self._user_path("drafts")).get(self.id_token).val() or {}
+            subjects_raw = self.db.child(self._user_path("subjects")).get(self.id_token).val()
             quizzes = list(quizzes_raw.values()) if isinstance(quizzes_raw, dict) else []
             drafts = [dict(v, _key=k) for k, v in drafts_raw.items()] if isinstance(drafts_raw, dict) else []
             subjects = subjects_raw if isinstance(subjects_raw, list) else None
@@ -589,42 +597,42 @@ class CloudStore:
             return None
 
     def save_quiz(self, quiz):
-        if not self.connected:
+        if not self.connected or not self.uid:
             return
         try:
-            self._user_ref().child("quizzes").child(quiz["id"]).set(quiz, self.id_token)
+            self.db.child(self._user_path("quizzes", quiz["id"])).set(quiz, self.id_token)
         except Exception as e:
             self.last_error = str(e)
 
     def delete_quiz(self, quiz_id):
-        if not self.connected:
+        if not self.connected or not self.uid:
             return
         try:
-            self._user_ref().child("quizzes").child(quiz_id).remove(self.id_token)
+            self.db.child(self._user_path("quizzes", quiz_id)).remove(self.id_token)
         except Exception as e:
             self.last_error = str(e)
 
     def save_draft(self, draft_payload, key):
-        if not self.connected:
+        if not self.connected or not self.uid:
             return
         try:
-            self._user_ref().child("drafts").child(key).set(draft_payload, self.id_token)
+            self.db.child(self._user_path("drafts", key)).set(draft_payload, self.id_token)
         except Exception as e:
             self.last_error = str(e)
 
     def delete_draft(self, key):
-        if not self.connected:
+        if not self.connected or not self.uid:
             return
         try:
-            self._user_ref().child("drafts").child(key).remove(self.id_token)
+            self.db.child(self._user_path("drafts", key)).remove(self.id_token)
         except Exception as e:
             self.last_error = str(e)
 
     def save_subjects(self, subjects):
-        if not self.connected:
+        if not self.connected or not self.uid:
             return
         try:
-            self._user_ref().child("subjects").set(subjects, self.id_token)
+            self.db.child(self._user_path("subjects")).set(subjects, self.id_token)
         except Exception as e:
             self.last_error = str(e)
 
@@ -662,29 +670,7 @@ SAMPLE_QUIZZES = [
 ]
 
 SAMPLE_DRAFTS = [
-    {
-        "title": "World History Quiz", "subject": "History",
-        "description": "Key revolutions and geopolitical treaties of the early modern era.",
-        "difficulty": "Medium", "time_mins": 15, "icon": "📄",
-        "questions": [
-            {"question": "Which historic treaty concluded the Thirty Years' War in 1648?",
-             "options": ["Peace of Westphalia", "Treaty of Versailles", "Treaty of Utrecht", "Congress of Vienna"],
-             "correct_index": 0, "explanation": "The Peace of Westphalia established the concept of state sovereignty."},
-            {"question": "In what year did the French Revolution officially begin with the storming of the Bastille?",
-             "options": ["1776", "1789", "1804", "1815"],
-             "correct_index": 1, "explanation": "The storming of the Bastille took place on July 14, 1789."},
-        ],
-    },
-    {
-        "title": "Physics Lab Safety", "subject": "Science",
-        "description": "Essential laboratory safety protocols and emergency guidelines.",
-        "difficulty": "Easy", "time_mins": 10, "icon": "📄",
-        "questions": [
-            {"question": "What is the very first action you should take in case of a chemical spill in the laboratory?",
-             "options": ["Immediately notify the instructor", "Try to clean it up with paper towels", "Leave the building", "Pour water on it"],
-             "correct_index": 0, "explanation": "Always notify the instructor immediately before taking action."},
-        ],
-    },
+    
 ]
 
 
@@ -695,20 +681,30 @@ class ProfQuizzerApp:
     def __init__(self, page: ft.Page):
         self.page = page
 
-        # ---- App preferences (dark mode, question order, ...) ----
+        # ---- App preferences (dark mode, question order, answering mode, ui mode...) ----
         settings = _load_settings()
         self.dark_mode = bool(settings.get("dark_mode", False))
         self.randomize_questions = bool(settings.get("randomize_questions", False))
+        self.default_answer_mode = settings.get("default_answer_mode", "standard")
+        self.ui_mode = settings.get("ui_mode", "mobile")  # "mobile" (460px) or "desktop" (full width)
+        self.quiz_answering_mode = self.default_answer_mode
+        self.question_answer_modes = {}
         _apply_theme(self.dark_mode)
 
         page.title = "Quiz Master"
-        page.bgcolor = BG_APP
+        page.bgcolor = SURFACE_MID
         page.padding = 0
         page.spacing = 0
         page.theme = ft.Theme(font_family=FONT_FAMILY)
-        page.window.width = 420
+        # Window size: add 16px buffer so the 460px shell never clips behind OS scrollbars/borders
+        page.window.width = 476
         page.window.height = 860
-        page.window.min_width = 340
+        page.window.min_width = 356
+        # Set app icon (works on desktop; when packaging, flet build uses assets/icon.png automatically)
+        try:
+            page.window.icon = "assets/icon.png"
+        except Exception:
+            pass
 
         # ---- Configure Google OAuth Provider ----
         self.auth_mode = "login"  # "login" or "signup"
@@ -753,21 +749,44 @@ class ProfQuizzerApp:
         self.lib_search_text = ""
         self.editing_question_idx = None
         self.correct_option_idx = "0"
+        self.current_question_type = "multiple_choice"
 
         # ---- Chrome: body + bottom nav ----
         self.active_nav = 0
         self.body = ft.Container(expand=True)
         self.bottom_nav = self._build_bottom_nav()
 
-        page.add(
-            ft.Column([self.body, self.bottom_nav], expand=True, spacing=0)
+        # Shell width: 460px for mobile UI, or expand to fill for desktop UI
+        shell_width = None if self.ui_mode == "desktop" else 460
+        self.app_shell = ft.Container(
+            content=ft.Column([self.body, self.bottom_nav], expand=True, spacing=0),
+            width=shell_width,
+            expand=(self.ui_mode == "desktop"),
+            bgcolor=BG_APP,
+            shadow=ft.BoxShadow(blur_radius=24, offset=ft.Offset(0, 0), color="#00000022"),
         )
 
+        page.add(
+            ft.Row(
+                [self.app_shell],
+                alignment=ft.MainAxisAlignment.CENTER,
+                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+                expand=True,
+            )
+        )
+        self._apply_ui_window_mode()
 
-        # Start at login screen, then try to silently restore a saved
-        # session in the background (won't block the UI either way)
-        self.goto_login()
-        threading.Thread(target=self._try_auto_login, daemon=True).start()
+        # Restore saved session directly at launch if available
+        saved_session = _load_session()
+        if saved_session and (saved_session.get("email") or saved_session.get("uid")):
+            self.logged_in = True
+            self.user_email = saved_session.get("email")
+            self.user_name = (self.user_email or "User").split("@")[0]
+            self._load_local_cache_for_user(self.user_email or saved_session.get("uid"))
+            self.goto_dashboard()
+            threading.Thread(target=self._try_auto_login, daemon=True).start()
+        else:
+            self.goto_login()
 
     # ──────────────────────────────────────────────────────────────────
     # Google OAuth Handlers
@@ -783,20 +802,25 @@ class ProfQuizzerApp:
         threading.Thread(target=self._google_login_worker, daemon=True).start()
 
     def _try_auto_login(self):
-        """Runs once at startup: if a saved session exists on this device,
-        silently restore it instead of making the user log in again."""
+        """Runs in background: verifies and refreshes session with Firebase."""
         session = _load_session()
         if not session or not session.get("refresh_token"):
             return
         ok, err = self.cloud.refresh_session(session["refresh_token"], session.get("email"))
         if not ok:
-            _clear_session()  # stale/expired/revoked — stop retrying it
+            # Session expired/revoked on server
+            _clear_session()
+            self.logged_in = False
+            self.user_email = None
+            self.user_name = None
+            self.goto_login()
+            self.toast("Session expired. Please log in again.", bgcolor=ERROR)
             return
         self.logged_in = True
         self.user_email = self.cloud.email or session.get("email")
         self.user_name = (self.user_email or "User").split("@")[0]
         _save_session(self.cloud.refresh_token, self.cloud.uid, self.user_email)
-        self._after_auth_success(self.user_email)
+        threading.Thread(target=self._sync_after_login, daemon=True).start()
 
     def _google_login_worker(self):
         id_token, access_token, err = _run_google_oauth_flow(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
@@ -880,7 +904,8 @@ class ProfQuizzerApp:
         """Runs in a background thread right after a successful sign-in/up."""
         result = self.cloud.fetch_all()
         if not result:
-            print("Cloud sync unavailable:", _friendly_firebase_error(self.cloud.last_error or ""))
+            err = self.cloud.last_error or ""
+            print("Cloud sync unavailable (running in local offline mode):", err if err else "Firebase database offline")
             return
         quizzes, drafts, subjects = result
         if quizzes or drafts or subjects:
@@ -906,10 +931,20 @@ class ProfQuizzerApp:
             self.toast("☁ Synced with the cloud")
         except Exception:
             pass
-        if self.current_route == "dashboard":
-            self._set_body(self.build_dashboard(), active_nav=0)
-        elif self.current_route == "library":
-            self._set_body(self.build_library(), active_nav=1)
+        if self.current_route == "dashboard" and hasattr(self, "quiz_cards_container"):
+            try:
+                self.quiz_cards_container.controls = self._get_quiz_card_controls()
+                self.quiz_cards_container.update()
+                self.page.update()
+            except Exception:
+                pass
+        elif self.current_route == "library" and hasattr(self, "lib_cards_container"):
+            try:
+                self.lib_cards_container.controls = self._get_library_card_controls()
+                self.lib_cards_container.update()
+                self.page.update()
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────────────────────────────
     # Small helpers
@@ -928,6 +963,8 @@ class ProfQuizzerApp:
         _save_settings({
             "dark_mode": self.dark_mode,
             "randomize_questions": self.randomize_questions,
+            "default_answer_mode": self.default_answer_mode,
+            "ui_mode": self.ui_mode,
         })
 
     def _toggle_dark_mode(self, e):
@@ -940,11 +977,56 @@ class ProfQuizzerApp:
         self.randomize_questions = e.control.value
         self._persist_settings()
 
+    def _toggle_answer_mode(self, e):
+        self.default_answer_mode = "fill_blank" if e.control.value else "standard"
+        self.quiz_answering_mode = self.default_answer_mode
+        self._persist_settings()
+
+    def _apply_ui_window_mode(self):
+        """Locks window size and disables resizing in Mobile mode; allows free resizing in Desktop mode."""
+        try:
+            if self.ui_mode == "mobile":
+                self.app_shell.width = 460
+                self.app_shell.expand = False
+                # Lock window size on desktop
+                self.page.window.resizable = False
+                self.page.window.maximizable = False
+                self.page.window.width = 476
+                self.page.window.height = 860
+                self.page.window.min_width = 476
+                self.page.window.max_width = 476
+                self.page.window.min_height = 860
+                self.page.window.max_height = 860
+            else:
+                self.app_shell.width = None
+                self.app_shell.expand = True
+                # Allow free window resize and maximize on desktop
+                self.page.window.resizable = True
+                self.page.window.maximizable = True
+                self.page.window.min_width = 500
+                self.page.window.max_width = None
+                self.page.window.min_height = 600
+                self.page.window.max_height = None
+                if (self.page.window.width or 0) <= 476:
+                    self.page.window.width = 1000
+                    self.page.window.height = 860
+        except Exception:
+            pass
+
+    def _toggle_ui_mode(self, e):
+        self.ui_mode = "desktop" if e.control.value else "mobile"
+        self._persist_settings()
+        self._apply_ui_window_mode()
+        self.app_shell.update()
+        self.page.update()
+
     def _refresh_theme(self):
         """Repaints everything already on screen after a theme change: the
         page background, the bottom nav (built once at startup, so it needs
         an explicit repaint), and whatever screen is currently shown."""
-        self.page.bgcolor = BG_APP
+        self.page.bgcolor = SURFACE_MID
+        self.app_shell.bgcolor = BG_APP
+        self.app_shell.update()
         self._rebuild_bottom_nav_colors()
         if self.current_route == "dashboard":
             self._set_body(self.build_dashboard(), active_nav=0)
@@ -994,14 +1076,36 @@ class ProfQuizzerApp:
             ft.Switch(value=self.randomize_questions, on_change=self._toggle_randomize),
         ], vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
+        mode_row = ft.Row([
+            ft.Column([
+                ft.Text("Answer MC via Fill in the Blank", size=14, weight=ft.FontWeight.W_800, color=TEXT_ON_SURFACE),
+                ft.Text("Default to typing answers for multiple-choice questions.",
+                        size=11, color=TEXT_MUTED),
+            ], spacing=2, expand=True),
+            ft.Switch(value=(self.default_answer_mode == "fill_blank"), on_change=self._toggle_answer_mode),
+        ], vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+        ui_mode_row = ft.Row([
+            ft.Column([
+                ft.Text("Desktop UI Mode", size=14, weight=ft.FontWeight.W_800, color=TEXT_ON_SURFACE),
+                ft.Text("Expand the app to fill the full screen width (great for web & desktop).",
+                        size=11, color=TEXT_MUTED),
+            ], spacing=2, expand=True),
+            ft.Switch(value=(self.ui_mode == "desktop"), on_change=self._toggle_ui_mode),
+        ], vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
         settings_card = card(ft.Column([
             ft.Text("Appearance & Quiz Behavior", size=15, weight=ft.FontWeight.W_800, color=PRIMARY),
             dark_row,
             ft.Container(height=1, bgcolor=BORDER_COLOR),
             random_row,
+            ft.Container(height=1, bgcolor=BORDER_COLOR),
+            mode_row,
+            ft.Container(height=1, bgcolor=BORDER_COLOR),
+            ui_mode_row,
         ], spacing=14))
 
-        more_note = ft.Text("More settings will be added here soon.", size=11,
+        more_note = ft.Text("Preferences are saved automatically on this device.", size=11,
                              italic=True, color=TEXT_MUTED, text_align=ft.TextAlign.CENTER)
 
         content = ft.ListView(
@@ -1010,11 +1114,16 @@ class ProfQuizzerApp:
         )
         return ft.Column([header, content], expand=True, spacing=0)
 
-    def toast(self, message, bgcolor=None):
+    def toast(self, message, bgcolor=None, duration=1000):
         if bgcolor is None:
             bgcolor = PRIMARY
         self.page.overlay.append(
-            ft.SnackBar(content=ft.Text(message, color="white"), bgcolor=bgcolor, open=True)
+            ft.SnackBar(
+                content=ft.Text(message, color="white"),
+                bgcolor=bgcolor,
+                duration=duration,
+                open=True,
+            )
         )
         self.page.update()
 
@@ -1307,7 +1416,7 @@ class ProfQuizzerApp:
             )
             fields.append(ft.Row([ft.Container(expand=True), forgot_btn]))
 
-        form_card = card(ft.Column(fields, spacing=8))
+        form_card = card(ft.Column(fields, spacing=8, horizontal_alignment=ft.CrossAxisAlignment.STRETCH))
 
         self.login_submit_text = ft.Text(
             "Sign Up" if is_signup else "Log In",
@@ -1417,7 +1526,7 @@ class ProfQuizzerApp:
             )
 
         content_controls = [
-            ft.Container(height=24),
+            ft.Container(height=16),
             logo,
             title,
             subtitle,
@@ -1432,16 +1541,26 @@ class ProfQuizzerApp:
             content_controls.append(notice)
         content_controls.append(offline_btn)
 
-        content = ft.Container(
+        auth_box = ft.Container(
             content=ft.Column(
                 controls=content_controls,
                 spacing=14,
-                scroll=ft.ScrollMode.AUTO,
-                expand=True,
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
-            padding=ft.Padding.symmetric(horizontal=28, vertical=16),
+            width=420,
+            padding=ft.Padding.symmetric(horizontal=16, vertical=8),
+        )
+
+        content = ft.Container(
+            content=ft.ListView(
+                controls=[
+                    ft.Row([auth_box], alignment=ft.MainAxisAlignment.CENTER),
+                ],
+                expand=True,
+                padding=ft.Padding.symmetric(vertical=12),
+            ),
             expand=True,
+            alignment=ft.Alignment.CENTER,
         )
         return ft.Column([content], expand=True, spacing=0)
 
@@ -1637,9 +1756,16 @@ class ProfQuizzerApp:
         self.quiz_cards_container.controls = self._get_quiz_card_controls()
         self.quiz_cards_container.update()
 
+    def _quiz_badge_colors(self, q):
+        color = q.get("cover_color") or q.get("badge_color")
+        if not color or color in (LIGHT_THEME["PRIMARY"], DARK_THEME["PRIMARY"], "PRIMARY"):
+            return PRIMARY, PRIMARY_LIGHT
+        return color, hex_to_light_bg(color, dark=self.dark_mode)
+
     def _dashboard_quiz_card(self, q):
+        badge_fg, badge_bg = self._quiz_badge_colors(q)
         top_row = ft.Row([
-            pill(q["subject"].upper(), q.get("badge_color", PRIMARY), q.get("badge_bg", PRIMARY_LIGHT)),
+            pill(q["subject"].upper(), badge_fg, badge_bg),
             ft.Text(f"{len(q['questions'])} Questions", size=11, weight=ft.FontWeight.W_600, color=TEXT_MUTED),
             ft.Container(expand=True),
             kebab_menu([
@@ -1863,8 +1989,9 @@ class ProfQuizzerApp:
       return results
 
     def _library_quiz_card(self, q):
+        badge_fg, badge_bg = self._quiz_badge_colors(q)
         top_row = ft.Row([
-            pill(q["subject"].upper(), q.get("badge_color", PRIMARY), q.get("badge_bg", PRIMARY_LIGHT)),
+            pill(q["subject"].upper(), badge_fg, badge_bg),
             ft.Container(expand=True),
             ft.Text(f"Code: {q.get('code', q['id'])}", size=10, weight=ft.FontWeight.BOLD, color=TEXT_MUTED),
             kebab_menu([
@@ -1909,6 +2036,7 @@ class ProfQuizzerApp:
             self.new_quiz_data = self._blank_quiz_data()
             self.current_difficulty = "Medium"
             self.color_choice = PRIMARY
+            self.current_question_type = "multiple_choice"
         self._set_body(self.build_create_setup(), show_nav=False)
 
     def open_quiz_editor(self, quiz):
@@ -2100,6 +2228,26 @@ class ProfQuizzerApp:
         )
         q_card = card(ft.Column([field_label("Question Prompt"), self.input_question_text], spacing=8))
 
+        # ---- Question type toggle: Multiple Choice vs Fill in the Blank ----
+        self.qtype_buttons = {}
+        qtype_row = []
+        for qt, label in [("multiple_choice", "Multiple Choice"), ("fill_blank", "Fill in the Blank")]:
+            active = qt == self.current_question_type
+            btn = ft.Container(
+                content=ft.Text(label, size=12, weight=ft.FontWeight.BOLD if active else ft.FontWeight.W_600,
+                                 color="white" if active else TEXT_ON_SURFACE),
+                bgcolor=PRIMARY if active else SURFACE_LOW,
+                border=None if active else ft.Border.all(1, BORDER_COLOR),
+                border_radius=10, height=38, expand=True, alignment=ft.Alignment.CENTER,
+                on_click=lambda e, t=qt: self._select_question_type(t), ink=True,
+            )
+            self.qtype_buttons[qt] = btn
+            qtype_row.append(btn)
+        qtype_card = card(ft.Column([
+            field_label("Question Type"),
+            ft.Row(qtype_row, spacing=8),
+        ], spacing=8))
+
         self.opt_inputs = []
         self.opt_tags = []
         self.opt_rows = []
@@ -2130,6 +2278,23 @@ class ProfQuizzerApp:
             field_label("Options (select the radio button for the correct answer)"),
             self.radio_group,
         ], spacing=10))
+        opt_card.visible = (self.current_question_type == "multiple_choice")
+        self.opt_card_container = opt_card
+
+        # ---- Fill in the blank: single correct-answer text field ----
+        self.input_blank_answer = ft.TextField(
+            hint_text="Type the exact correct answer...", height=48,
+            border_radius=12, border_color=BORDER_COLOR, content_padding=ft.Padding.only(left=12),
+            color=INPUT_TEXT_COLOR,
+        )
+        blank_card = card(ft.Column([
+            field_label("Correct Answer"),
+            self.input_blank_answer,
+            ft.Text("Students' typed answers aren't case-sensitive and ignore extra spaces.",
+                    size=11, color=TEXT_MUTED),
+        ], spacing=8))
+        blank_card.visible = (self.current_question_type == "fill_blank")
+        self.blank_card_container = blank_card
 
         add_more_btn = ft.Container(
             content=ft.Text("+ Save & Add Question to Quiz", size=13, weight=ft.FontWeight.BOLD, color=PRIMARY),
@@ -2146,7 +2311,7 @@ class ProfQuizzerApp:
             controls=[
                 self.existing_q_header, self.existing_q_list,
                 ft.Container(height=1, bgcolor=BORDER_COLOR),
-                self.q_form_header, q_card, opt_card, add_more_btn, review_btn,
+                self.q_form_header, q_card, qtype_card, opt_card, blank_card, add_more_btn, review_btn,
             ],
             spacing=14, padding=ft.Padding.symmetric(horizontal=20, vertical=16), expand=True,
         )
@@ -2155,13 +2320,27 @@ class ProfQuizzerApp:
     def goto_create_setup_from_step2(self):
         self._set_body(self.build_create_setup(), show_nav=False)
 
+    def _select_question_type(self, qtype):
+        self.current_question_type = qtype
+        for qt, btn in self.qtype_buttons.items():
+            active = qt == qtype
+            btn.bgcolor = PRIMARY if active else SURFACE_LOW
+            btn.border = None if active else ft.Border.all(1, BORDER_COLOR)
+            btn.content.color = "white" if active else TEXT_ON_SURFACE
+            btn.content.weight = ft.FontWeight.BOLD if active else ft.FontWeight.W_600
+            btn.update()
+        self.opt_card_container.visible = (qtype == "multiple_choice")
+        self.blank_card_container.visible = (qtype == "fill_blank")
+        self.opt_card_container.update()
+        self.blank_card_container.update()
+
     def _on_correct_radio_change(self, e):
         self.correct_option_idx = e.control.value
         self._refresh_option_row_styles()
 
     def _refresh_option_row_styles(self):
         theme_color = self.new_quiz_data.get("cover_color", PRIMARY)
-        light_bg = hex_to_light_bg(theme_color)
+        light_bg = hex_to_light_bg(theme_color, dark=self.dark_mode)
         checked_idx = int(self.correct_option_idx)
         for i, (row, tag, inp) in enumerate(zip(self.opt_rows, self.opt_tags, self.opt_inputs)):
             is_checked = i == checked_idx
@@ -2172,6 +2351,7 @@ class ProfQuizzerApp:
                 tag.content.color = "white"
                 inp.border_color = theme_color
                 inp.border_width = 2
+                inp.color = INPUT_TEXT_COLOR
             else:
                 row.bgcolor = None
                 row.border = ft.Border.all(1.5, "transparent")
@@ -2179,6 +2359,7 @@ class ProfQuizzerApp:
                 tag.content.color = TEXT_MUTED
                 inp.border_color = BORDER_COLOR
                 inp.border_width = 1
+                inp.color = INPUT_TEXT_COLOR
             row.update()
             tag.update()
             inp.update()
@@ -2190,17 +2371,20 @@ class ProfQuizzerApp:
                              size=12, italic=True, color=TEXT_MUTED)]
         rows = []
         for idx, q in enumerate(questions):
+            q_type = q.get("question_type", "multiple_choice")
+            type_label = "Fill Blank" if q_type == "fill_blank" else "MC"
             rows.append(
                 ft.Container(
                     bgcolor=BG_SURFACE, border=ft.Border.all(1, BORDER_COLOR), border_radius=10,
                     padding=ft.Padding.symmetric(horizontal=12, vertical=8),
                     content=ft.Row([
+                        pill(type_label, PRIMARY, PRIMARY_LIGHT, size=9),
                         ft.Text(f"Q{idx + 1}: {q['question']}", size=12, color=TEXT_ON_SURFACE, expand=True),
                         kebab_menu([
                             ("✏️  Edit Question", lambda e, i=idx: self._load_question_for_editing(i)),
                             ("🗑️  Delete Question", lambda e, i=idx: self._delete_question_from_new_quiz(i)),
                         ]),
-                    ]),
+                    ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 )
             )
         return rows
@@ -2217,21 +2401,41 @@ class ProfQuizzerApp:
         if not (0 <= q_idx < len(questions)):
             return
         target = questions[q_idx]
+        q_type = target.get("question_type", "multiple_choice")
         self.input_question_text.value = target["question"]
-        for i, opt in enumerate(self.opt_inputs):
-            opt.value = target["options"][i] if i < len(target["options"]) else ""
-        corr = target.get("correct_index", 0)
-        self.correct_option_idx = str(corr if corr < len(self.opt_inputs) else 0)
-        self.radio_group.value = self.correct_option_idx
+
+        self.current_question_type = q_type
+        for qt, btn in self.qtype_buttons.items():
+            active = qt == q_type
+            btn.bgcolor = PRIMARY if active else SURFACE_LOW
+            btn.border = None if active else ft.Border.all(1, BORDER_COLOR)
+            btn.content.color = "white" if active else TEXT_ON_SURFACE
+            btn.content.weight = ft.FontWeight.BOLD if active else ft.FontWeight.W_600
+            btn.update()
+        self.opt_card_container.visible = (q_type == "multiple_choice")
+        self.blank_card_container.visible = (q_type == "fill_blank")
+        self.opt_card_container.update()
+        self.blank_card_container.update()
+
+        if q_type == "fill_blank":
+            self.input_blank_answer.value = target.get("correct_answer", "")
+            self.input_blank_answer.update()
+        else:
+            for i, opt in enumerate(self.opt_inputs):
+                opt.value = target["options"][i] if i < len(target["options"]) else ""
+            corr = target.get("correct_index", 0)
+            self.correct_option_idx = str(corr if corr < len(self.opt_inputs) else 0)
+            self.radio_group.value = self.correct_option_idx
+            for opt in self.opt_inputs:
+                opt.update()
+            self.radio_group.update()
+            self._refresh_option_row_styles()
+
         self.new_quiz_data["questions"].pop(q_idx)
         self.editing_question_idx = q_idx
         self.q_form_header.value = f"Editing Question #{q_idx + 1}"
         self._refresh_existing_questions()
         self.input_question_text.update()
-        for opt in self.opt_inputs:
-            opt.update()
-        self.radio_group.update()
-        self._refresh_option_row_styles()
         self.q_form_header.update()
 
     def _delete_question_from_new_quiz(self, q_idx):
@@ -2247,17 +2451,29 @@ class ProfQuizzerApp:
             opt.value = ""
         self.correct_option_idx = "0"
         self.radio_group.value = "0"
+        self.input_blank_answer.value = ""
         self.q_form_header.update()
         self.input_question_text.update()
         for opt in self.opt_inputs:
             opt.update()
         self.radio_group.update()
+        self.input_blank_answer.update()
         self._refresh_option_row_styles()
 
     def _extract_current_question(self):
         q_text = (self.input_question_text.value or "").strip()
         if not q_text:
             return None, "Please enter question text."
+        if self.current_question_type == "fill_blank":
+            answer = (self.input_blank_answer.value or "").strip()
+            if not answer:
+                return None, "Please enter the correct answer for this fill-in-the-blank question."
+            return {
+                "question_type": "fill_blank",
+                "question": q_text,
+                "correct_answer": answer,
+                "explanation": f'Correct answer is "{answer}".',
+            }, ""
         options = [inp.value.strip() for inp in self.opt_inputs if (inp.value or "").strip()]
         if len(options) < 2:
             return None, "Please provide at least 2 options for the question."
@@ -2265,6 +2481,7 @@ class ProfQuizzerApp:
         if correct_idx >= len(options) or correct_idx < 0:
             correct_idx = 0
         return {
+            "question_type": "multiple_choice",
             "question": q_text, "options": options, "correct_index": correct_idx,
             "explanation": f"Correct answer is {options[correct_idx]}.",
         }, ""
@@ -2277,7 +2494,6 @@ class ProfQuizzerApp:
         self.new_quiz_data["questions"].append(q_obj)
         self._refresh_existing_questions()
         self._reset_add_question_form()
-        self.toast(f"Question saved! Quiz now has {len(self.new_quiz_data['questions'])} questions.")
 
     def _save_question_and_review(self):
         if (self.input_question_text.value or "").strip():
@@ -2346,26 +2562,38 @@ class ProfQuizzerApp:
         questions = self.new_quiz_data.get("questions", [])
         cards = []
         for idx, q in enumerate(questions):
-            opt_rows = []
-            for o_idx, opt in enumerate(q.get("options", [])):
-                is_correct = o_idx == q.get("correct_index", 0)
-                opt_rows.append(
-                    ft.Text(
-                        f"[{LETTERS[o_idx]}] {opt}" + ("   ✓ (Correct Answer)" if is_correct else ""),
-                        size=12, weight=ft.FontWeight.W_800 if is_correct else ft.FontWeight.W_500,
-                        color=SUCCESS if is_correct else TEXT_VARIANT,
+            q_type = q.get("question_type", "multiple_choice")
+            type_tag = pill("Fill in the Blank" if q_type == "fill_blank" else "Multiple Choice",
+                             PRIMARY, PRIMARY_LIGHT, size=9)
+            if q_type == "fill_blank":
+                body_rows = [
+                    ft.Text(f'Correct Answer: "{q.get("correct_answer", "")}"', size=12,
+                            weight=ft.FontWeight.W_800, color=SUCCESS),
+                ]
+            else:
+                body_rows = []
+                for o_idx, opt in enumerate(q.get("options", [])):
+                    is_correct = o_idx == q.get("correct_index", 0)
+                    body_rows.append(
+                        ft.Text(
+                            f"[{LETTERS[o_idx]}] {opt}" + ("   ✓ (Correct Answer)" if is_correct else ""),
+                            size=12, weight=ft.FontWeight.W_800 if is_correct else ft.FontWeight.W_500,
+                            color=SUCCESS if is_correct else TEXT_VARIANT,
+                        )
                     )
-                )
             cards.append(
                 card(ft.Column([
                     ft.Row([
-                        ft.Text(f"Q{idx + 1}. {q['question']}", size=13, weight=ft.FontWeight.BOLD, expand=True),
+                        ft.Column([
+                            type_tag,
+                            ft.Text(f"Q{idx + 1}. {q['question']}", size=13, weight=ft.FontWeight.BOLD),
+                        ], spacing=4, expand=True),
                         kebab_menu([
                             ("✏️  Edit in Manager", lambda e, i=idx: self._edit_from_review(i)),
                             ("🗑️  Delete Question", lambda e, i=idx: self._delete_from_review(i)),
                         ]),
                     ]),
-                    *opt_rows,
+                    *body_rows,
                 ], spacing=6), padding=ft.Padding.symmetric(horizontal=14, vertical=12))
             )
         return cards
@@ -2407,7 +2635,8 @@ class ProfQuizzerApp:
                 "description": self.new_quiz_data.get("description", "Created with Quiz Master Studio"),
                 "difficulty": self.new_quiz_data.get("difficulty", "Medium"),
                 "time_mins": self.new_quiz_data.get("time_mins", 15), "edited": "Just now",
-                "badge_color": self.new_quiz_data.get("cover_color", PRIMARY), "badge_bg": PRIMARY_LIGHT,
+                "cover_color": self.new_quiz_data.get("cover_color", PRIMARY),
+                "badge_color": self.new_quiz_data.get("cover_color", PRIMARY),
                 "icon": "📝", "students_taken": 0, "questions": list(self.new_quiz_data.get("questions", [])),
             }
             self.quizzes.insert(0, new_quiz)
@@ -2447,11 +2676,54 @@ class ProfQuizzerApp:
     # ══════════════════════════════════════════════════════════════════
     def open_quiz_intro(self, quiz):
         self.current_quiz = quiz
+        self.quiz_answering_mode = self.default_answer_mode
         self._set_body(self.build_intro(), show_nav=False)
 
     def build_intro(self):
         q = self.current_quiz
         header = self.build_header("Quiz Overview", show_back=True, on_back=self.goto_dashboard)
+
+        has_mc = any(qq.get("question_type", "multiple_choice") == "multiple_choice" or bool(qq.get("options")) for qq in q["questions"])
+        q_types_present = set(qq.get("question_type", "multiple_choice") for qq in q["questions"])
+        if q_types_present == {"fill_blank"}:
+            format_label = "Fill in the Blank"
+        elif q_types_present == {"multiple_choice"}:
+            format_label = "Multiple Choice"
+        else:
+            format_label = "Mixed Format"
+
+        mode_selector_section = []
+        if has_mc:
+            is_mc_mode = self.quiz_answering_mode != "fill_blank"
+            btn_mc = ft.Container(
+                content=ft.Row([
+                    ft.Text("🔘", size=13),
+                    ft.Text("Multiple Choice", size=12, weight=ft.FontWeight.BOLD if is_mc_mode else ft.FontWeight.W_500,
+                            color="white" if is_mc_mode else TEXT_ON_SURFACE),
+                ], spacing=6, alignment=ft.MainAxisAlignment.CENTER),
+                bgcolor=PRIMARY if is_mc_mode else SURFACE_LOW,
+                border=None if is_mc_mode else ft.Border.all(1, BORDER_COLOR),
+                border_radius=10, height=40, expand=True, alignment=ft.Alignment.CENTER,
+                on_click=lambda e: self._set_intro_answer_mode("standard"), ink=True,
+            )
+            btn_fb = ft.Container(
+                content=ft.Row([
+                    ft.Text("✍️", size=13),
+                    ft.Text("Fill in Blank", size=12, weight=ft.FontWeight.BOLD if not is_mc_mode else ft.FontWeight.W_500,
+                            color="white" if not is_mc_mode else TEXT_ON_SURFACE),
+                ], spacing=6, alignment=ft.MainAxisAlignment.CENTER),
+                bgcolor=PRIMARY if not is_mc_mode else SURFACE_LOW,
+                border=None if not is_mc_mode else ft.Border.all(1, BORDER_COLOR),
+                border_radius=10, height=40, expand=True, alignment=ft.Alignment.CENTER,
+                on_click=lambda e: self._set_intro_answer_mode("fill_blank"), ink=True,
+            )
+            mode_selector_section = [
+                ft.Container(height=4),
+                ft.Text("MC Question Answering Style:", size=12, weight=ft.FontWeight.BOLD, color=TEXT_ON_SURFACE),
+                ft.Row([btn_mc, btn_fb], spacing=8),
+                ft.Text("Choose to answer multiple-choice questions by clicking options or typing the answers.",
+                        size=11, color=TEXT_MUTED, text_align=ft.TextAlign.CENTER),
+            ]
 
         hero = card(ft.Column([
             ft.Container(
@@ -2464,13 +2736,14 @@ class ProfQuizzerApp:
             ft.Container(
                 bgcolor=SURFACE_LOW, border_radius=14, padding=ft.Padding.symmetric(horizontal=16, vertical=12),
                 content=ft.Column([
-                    ft.Text(f"📋  {len(q['questions'])} Questions  ·  Multiple Choice", size=12,
+                    ft.Text(f"📋  {len(q['questions'])} Questions  ·  {format_label}", size=12,
                             weight=ft.FontWeight.W_800, color=PRIMARY),
                     ft.Text(f"⏱  {q.get('time_mins', 15)} Minutes  ·  Timed Assessment", size=12,
                             weight=ft.FontWeight.W_600),
                     ft.Text(f"📊  {q.get('difficulty', 'Intermediate')} Level", size=12, weight=ft.FontWeight.W_600),
                 ], spacing=8),
             ),
+            *mode_selector_section,
             ft.Container(
                 content=ft.Text("Start Quiz Now  ▶", size=16, weight=ft.FontWeight.BOLD, color="white"),
                 bgcolor=PRIMARY, border_radius=14, height=52, alignment=ft.Alignment.CENTER,
@@ -2481,6 +2754,10 @@ class ProfQuizzerApp:
 
         content = ft.ListView(controls=[hero], padding=ft.Padding.all(24), expand=True)
         return ft.Column([header, content], expand=True, spacing=0)
+
+    def _set_intro_answer_mode(self, mode):
+        self.quiz_answering_mode = mode
+        self._set_body(self.build_intro(), show_nav=False)
 
     # ══════════════════════════════════════════════════════════════════
     # SCREEN 7: Live Quiz Taking
@@ -2497,6 +2774,13 @@ class ProfQuizzerApp:
             self.current_quiz = dict(self.current_quiz, questions=shuffled)
         self.quiz_question_idx = 0
         self.user_answers = [None] * len(self.current_quiz["questions"])
+        self.question_answer_modes = {}
+        for idx, q in enumerate(self.current_quiz["questions"]):
+            if self.quiz_answering_mode == "fill_blank" and q.get("options"):
+                self.question_answer_modes[idx] = "fill_blank"
+            else:
+                self.question_answer_modes[idx] = q.get("question_type", "multiple_choice")
+
         self.quiz_total_seconds = self.current_quiz.get("time_mins", 15) * 60
         self.quiz_seconds_left = self.quiz_total_seconds
         self.timer_running = True
@@ -2547,7 +2831,7 @@ class ProfQuizzerApp:
                                    weight=ft.FontWeight.W_800, color=PRIMARY)
         self.lbl_q_text = ft.Text("", size=16, weight=ft.FontWeight.W_800, color=TEXT_ON_SURFACE)
 
-        self.taking_options_col = ft.Column(spacing=10)
+        self.taking_options_col = ft.Column(spacing=10, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
         self.btn_next_q_text = ft.Text("Next Question →", size=15, weight=ft.FontWeight.BOLD, color="white")
         self.btn_next_q = ft.Container(
             content=self.btn_next_q_text, bgcolor=PRIMARY, border_radius=12, height=48, expand=True,
@@ -2572,25 +2856,104 @@ class ProfQuizzerApp:
         self._render_current_live_question()
         return ft.Column([header, self.taking_progress, content, bottom_bar], expand=True, spacing=0)
 
+    def _switch_question_mode(self, q_idx, mode):
+        self.question_answer_modes[q_idx] = mode
+        self._render_current_live_question()
+        self.taking_options_col.update()
+
     def _render_current_live_question(self):
         questions = self.current_quiz["questions"]
         total = len(questions)
         curr = questions[self.quiz_question_idx]
+        q_type = curr.get("question_type", "multiple_choice")
+        has_mc_options = bool(curr.get("options"))
 
         self.taking_progress.value = (self.quiz_question_idx + 1) / total
         self.lbl_q_step.value = f"QUESTION {self.quiz_question_idx + 1} OF {total}"
         self.lbl_q_text.value = curr["question"]
 
         selected_answer = self.user_answers[self.quiz_question_idx]
-        self.live_option_buttons = []
-        rows = []
-        for idx, opt_text in enumerate(curr["options"]):
-            row = self._build_live_option(idx, opt_text, selected_answer == idx)
-            self.live_option_buttons.append(row)
-            rows.append(row)
-        self.taking_options_col.controls = rows
+        effective_mode = self.question_answer_modes.get(self.quiz_question_idx, q_type)
+
+        mode_header_controls = []
+        if has_mc_options:
+            is_fb = effective_mode == "fill_blank"
+            btn_mc = ft.Container(
+                content=ft.Row([
+                    ft.Text("🔘", size=11),
+                    ft.Text("Multiple Choice", size=11, weight=ft.FontWeight.BOLD if not is_fb else ft.FontWeight.W_500,
+                            color="white" if not is_fb else TEXT_MUTED),
+                ], spacing=4, alignment=ft.MainAxisAlignment.CENTER),
+                bgcolor=PRIMARY if not is_fb else SURFACE_LOW,
+                border=None if not is_fb else ft.Border.all(1, BORDER_COLOR),
+                border_radius=8, height=32, padding=ft.Padding.symmetric(horizontal=10),
+                alignment=ft.Alignment.CENTER,
+                on_click=lambda e: self._switch_question_mode(self.quiz_question_idx, "multiple_choice"), ink=True,
+            )
+            btn_fb = ft.Container(
+                content=ft.Row([
+                    ft.Text("✍️", size=11),
+                    ft.Text("Fill in Blank", size=11, weight=ft.FontWeight.BOLD if is_fb else ft.FontWeight.W_500,
+                            color="white" if is_fb else TEXT_MUTED),
+                ], spacing=4, alignment=ft.MainAxisAlignment.CENTER),
+                bgcolor=PRIMARY if is_fb else SURFACE_LOW,
+                border=None if is_fb else ft.Border.all(1, BORDER_COLOR),
+                border_radius=8, height=32, padding=ft.Padding.symmetric(horizontal=10),
+                alignment=ft.Alignment.CENTER,
+                on_click=lambda e: self._switch_question_mode(self.quiz_question_idx, "fill_blank"), ink=True,
+            )
+            mode_header_controls = [
+                ft.Container(
+                    content=ft.Row([
+                        ft.Text("Answer Style:", size=11, weight=ft.FontWeight.BOLD, color=TEXT_MUTED),
+                        ft.Container(expand=True),
+                        btn_mc,
+                        btn_fb,
+                    ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    padding=ft.Padding.only(bottom=4),
+                )
+            ]
+
+        if effective_mode == "fill_blank":
+            self.taking_options_col.controls = mode_header_controls + [
+                self._build_fill_blank_input(selected_answer, is_converted_mc=has_mc_options)
+            ]
+        else:
+            self.live_option_buttons = []
+            rows = []
+            for idx, opt_text in enumerate(curr.get("options", [])):
+                row = self._build_live_option(idx, opt_text, selected_answer == idx)
+                self.live_option_buttons.append(row)
+                rows.append(row)
+            self.taking_options_col.controls = mode_header_controls + rows
 
         self.btn_next_q_text.value = "Finish Quiz ✓" if self.quiz_question_idx == total - 1 else "Next Question →"
+
+    def _build_fill_blank_input(self, current_value, is_converted_mc=False):
+        field = ft.TextField(
+            value=current_value if isinstance(current_value, str) else "",
+            hint_text="Type answer (or option letter)..." if is_converted_mc else "Type your answer here...",
+            height=52, border_radius=14, border_color=BORDER_COLOR, bgcolor=BG_SURFACE,
+            content_padding=ft.Padding.symmetric(horizontal=16), text_size=14,
+            text_align=ft.TextAlign.CENTER,
+            color=INPUT_TEXT_COLOR, autofocus=True,
+            on_change=self._on_fill_blank_change,
+        )
+        self.fill_blank_field = field
+        controls = [field]
+        if is_converted_mc:
+            controls.append(
+                ft.Text("💡 You can type the full answer text or the option letter (A, B, C, D).",
+                        size=11, color=TEXT_MUTED, text_align=ft.TextAlign.CENTER)
+            )
+        return ft.Container(
+            content=ft.Column(controls, spacing=4, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+            alignment=ft.Alignment.CENTER,
+            padding=ft.Padding.symmetric(vertical=4),
+        )
+
+    def _on_fill_blank_change(self, e):
+        self.user_answers[self.quiz_question_idx] = e.control.value
 
     def _build_live_option(self, idx, text, selected):
         letter = LETTERS[idx] if idx < len(LETTERS) else str(idx)
@@ -2600,7 +2963,9 @@ class ProfQuizzerApp:
             bg, border_c, txt_c = BG_SURFACE, BORDER_COLOR, TEXT_ON_SURFACE
         return ft.Container(
             content=ft.Text(f"{letter}    {text}", size=13,
-                             weight=ft.FontWeight.BOLD if selected else ft.FontWeight.W_500, color=txt_c),
+                             weight=ft.FontWeight.BOLD if selected else ft.FontWeight.W_500, color=txt_c,
+                             text_align=ft.TextAlign.CENTER),
+            alignment=ft.Alignment.CENTER,
             bgcolor=bg, border=ft.Border.all(2 if selected else 1, border_c), border_radius=14,
             padding=ft.Padding.symmetric(horizontal=14, vertical=16),
             on_click=lambda e, i=idx: self._select_live_option(i), ink=True,
@@ -2644,12 +3009,39 @@ class ProfQuizzerApp:
             self.goto_dashboard()
         self.dialog_confirm("Exit Quiz?", "Are you sure you want to exit? Your progress will be lost.", do_exit)
 
+    def _is_answer_correct(self, q, user_answer):
+        q_type = q.get("question_type", "multiple_choice")
+        if isinstance(user_answer, str):
+            if not user_answer.strip():
+                return False
+            given = " ".join(user_answer.strip().lower().split())
+            if q_type == "fill_blank":
+                correct = " ".join(str(q.get("correct_answer", "")).strip().lower().split())
+                return given == correct
+            else:
+                # Multiple choice question answered in fill-in-the-blank mode
+                correct_idx = q.get("correct_index", 0)
+                options = q.get("options", [])
+                correct_opt = options[correct_idx] if 0 <= correct_idx < len(options) else ""
+                correct = " ".join(str(correct_opt).strip().lower().split())
+                if given == correct:
+                    return True
+                # Allow matching option letter e.g. "a", "b", "option a", "[a]", or "1"
+                if 0 <= correct_idx < len(LETTERS):
+                    letter = LETTERS[correct_idx].lower()
+                    if given in (letter, f"option {letter}", f"[{letter}]", str(correct_idx + 1)):
+                        return True
+                return False
+        elif isinstance(user_answer, int):
+            return user_answer == q.get("correct_index")
+        return False
+
     def _finish_quiz(self, timed_out=False):
         self.timer_running = False
         questions = self.current_quiz["questions"]
         correct_count = sum(
             1 for i, q in enumerate(questions)
-            if self.user_answers[i] is not None and self.user_answers[i] == q["correct_index"]
+            if self._is_answer_correct(q, self.user_answers[i])
         )
         pct = int((correct_count / len(questions)) * 100) if questions else 0
         points = correct_count * 25
@@ -2727,10 +3119,25 @@ class ProfQuizzerApp:
         questions = self.current_quiz["questions"]
         cards = []
         for idx, q in enumerate(questions):
-            user_idx = self.user_answers[idx]
-            correct_idx = q["correct_index"]
-            is_correct = user_idx == correct_idx
-            user_ans_text = q["options"][user_idx] if user_idx is not None else "Skipped"
+            q_type = q.get("question_type", "multiple_choice")
+            user_val = self.user_answers[idx]
+            is_correct = self._is_answer_correct(q, user_val)
+
+            if isinstance(user_val, str):
+                user_ans_text = user_val.strip() if user_val.strip() else "Skipped"
+            elif isinstance(user_val, int) and 0 <= user_val < len(q.get("options", [])):
+                user_ans_text = f"[{LETTERS[user_val]}] {q['options'][user_val]}"
+            else:
+                user_ans_text = "Skipped"
+
+            if q_type == "fill_blank":
+                correct_display = q.get("correct_answer", "")
+            else:
+                c_idx = q.get("correct_index", 0)
+                options = q.get("options", [])
+                correct_opt = options[c_idx] if 0 <= c_idx < len(options) else ""
+                letter = LETTERS[c_idx] if c_idx < len(LETTERS) else ""
+                correct_display = f"[{letter}] {correct_opt}" if letter else correct_opt
 
             status = ft.Container(
                 content=ft.Text("✓ Correct" if is_correct else "✕ Incorrect", size=11, weight=ft.FontWeight.BOLD,
@@ -2752,7 +3159,7 @@ class ProfQuizzerApp:
             if not is_correct:
                 children.append(
                     ft.Container(
-                        content=ft.Text(f"Correct Answer: {q['options'][correct_idx]}", size=12,
+                        content=ft.Text(f"Correct Answer: {correct_display}", size=12,
                                          weight=ft.FontWeight.BOLD, color=PRIMARY),
                         bgcolor=SURFACE_LOW, border=ft.Border.all(1, BORDER_COLOR), border_radius=10,
                         padding=ft.Padding.symmetric(horizontal=10, vertical=6),
