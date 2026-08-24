@@ -638,7 +638,7 @@ SAMPLE_QUIZZES = [
         "subject": "Biology", "category": "Science",
         "description": "Covers cellular respiration, photosynthesis, organelle structures, and membrane transport fundamentals.",
         "difficulty": "Intermediate", "time_mins": 15, "edited": "Edited 2h ago",
-        "badge_color": PRIMARY, "badge_bg": PRIMARY_LIGHT, "icon": "🔬", "students_taken": 67,
+        "badge_color": PRIMARY, "badge_bg": PRIMARY_LIGHT, "icon": "🔬", "students_taken": 142,
         "questions": [
             {"question": "What is the primary function of mitochondria in a eukaryotic cell?",
              "options": ["Protein synthesis and modification", "Cellular respiration and ATP energy production",
@@ -660,6 +660,33 @@ SAMPLE_QUIZZES = [
     },
 
 ]
+
+SAMPLE_DRAFTS = [
+    {
+        "title": "World History Quiz", "subject": "History",
+        "description": "Key revolutions and geopolitical treaties of the early modern era.",
+        "difficulty": "Medium", "time_mins": 15, "icon": "📄",
+        "questions": [
+            {"question": "Which historic treaty concluded the Thirty Years' War in 1648?",
+             "options": ["Peace of Westphalia", "Treaty of Versailles", "Treaty of Utrecht", "Congress of Vienna"],
+             "correct_index": 0, "explanation": "The Peace of Westphalia established the concept of state sovereignty."},
+            {"question": "In what year did the French Revolution officially begin with the storming of the Bastille?",
+             "options": ["1776", "1789", "1804", "1815"],
+             "correct_index": 1, "explanation": "The storming of the Bastille took place on July 14, 1789."},
+        ],
+    },
+    {
+        "title": "Physics Lab Safety", "subject": "Science",
+        "description": "Essential laboratory safety protocols and emergency guidelines.",
+        "difficulty": "Easy", "time_mins": 10, "icon": "📄",
+        "questions": [
+            {"question": "What is the very first action you should take in case of a chemical spill in the laboratory?",
+             "options": ["Immediately notify the instructor", "Try to clean it up with paper towels", "Leave the building", "Pour water on it"],
+             "correct_index": 0, "explanation": "Always notify the instructor immediately before taking action."},
+        ],
+    },
+]
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # Main App
@@ -809,6 +836,7 @@ class ProfQuizzerApp:
         """
         self.cache_file = _cache_path_for(email_or_uid)
         self.quizzes = copy.deepcopy(SAMPLE_QUIZZES)
+        self.drafts = copy.deepcopy(SAMPLE_DRAFTS)
         self.subjects = [
             "Science",
             "Biology",
@@ -1063,7 +1091,7 @@ class ProfQuizzerApp:
     # Header + Bottom Nav
     # ──────────────────────────────────────────────────────────────────
     
-    def build_header(self, title, subtitle=None, show_back=False, on_back=None):
+    def build_header(self, title, subtitle=None, show_back=False, on_back=None, show_logo=False):
         left_controls = []
 
         if show_back:
@@ -1074,6 +1102,11 @@ class ProfQuizzerApp:
                     icon_color=PRIMARY,
                     on_click=on_back,
                 )
+            )
+
+        if show_logo:
+            left_controls.append(
+                ft.Image(src="logo.png", width=44, height=44, fit=ft.BoxFit.CONTAIN)
             )
 
         title_column = ft.Column(
@@ -1096,7 +1129,7 @@ class ProfQuizzerApp:
                 ),
                 ft.Container(
                     content=ft.CircleAvatar(
-                        content=ft.Text("P", size=12, weight=ft.FontWeight.BOLD, color="white"),
+                        content=ft.Text("PQ", size=12, weight=ft.FontWeight.BOLD, color="white"),
                         bgcolor=PRIMARY,
                         radius=16,
                     ),
@@ -1198,11 +1231,11 @@ class ProfQuizzerApp:
         is_signup = self.auth_mode == "signup"
 
         logo = ft.Container(
-            content=ft.Text("📝", size=34),
-            width=76,
-            height=76,
+            content=ft.Image(src="logo.png", width=80, height=80, fit=ft.BoxFit.CONTAIN),
+            width=104,
+            height=104,
             bgcolor=PRIMARY_LIGHT,
-            border_radius=38,
+            border_radius=52,
             alignment=ft.Alignment.CENTER,
         )
         title = ft.Text(
@@ -1530,7 +1563,7 @@ class ProfQuizzerApp:
         )
 
     def build_dashboard(self):
-        header = self.build_header("Quiz Master")
+        header = self.build_header("Quiz Master", show_logo=True)
 
         search_row = ft.TextField(
             hint_text="🔍  Search quizzes by title or topic...", value=self.dash_search_text,
@@ -1714,7 +1747,7 @@ class ProfQuizzerApp:
             content_padding=ft.Padding.only(left=12), text_size=13, text_style=ft.TextStyle(color=INPUT_TEXT_COLOR),
         )
         join_card = card(ft.Column([
-            ft.Text("Join Live Session", size=15, weight=ft.FontWeight.W_800, color=TEXT_ON_SURFACE),
+            ft.Text("Join Live Session", size=15, weight=ft.FontWeight.W_800),
             ft.Row([
                 ft.Container(content=self.code_input, expand=True),
                 ft.Container(
@@ -2434,8 +2467,8 @@ class ProfQuizzerApp:
                     ft.Text(f"📋  {len(q['questions'])} Questions  ·  Multiple Choice", size=12,
                             weight=ft.FontWeight.W_800, color=PRIMARY),
                     ft.Text(f"⏱  {q.get('time_mins', 15)} Minutes  ·  Timed Assessment", size=12,
-                            weight=ft.FontWeight.W_600, color=PRIMARY),
-                    ft.Text(f"📊  {q.get('difficulty', 'Intermediate')} Level", size=12, weight=ft.FontWeight.W_600, color=PRIMARY),
+                            weight=ft.FontWeight.W_600),
+                    ft.Text(f"📊  {q.get('difficulty', 'Intermediate')} Level", size=12, weight=ft.FontWeight.W_600),
                 ], spacing=8),
             ),
             ft.Container(
@@ -2762,4 +2795,4 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.run(main, port=8550)
+    ft.run(main, port=8550, assets_dir="assets")
