@@ -42,9 +42,9 @@ pip install pyrebase4   # optional — skip if only using local-only mode
 ## Running the app
 
 ```bash
-flet run Quiz_Master.py          # desktop preview
-flet run --web Quiz_Master.py    # browser preview
-python Quiz_Master.py            # also works — the script calls ft.run(main) directly
+flet run main.py          # desktop preview
+flet run --web main.py    # browser / web preview
+python main.py            # direct python execution
 ```
 
 ## How data is stored
