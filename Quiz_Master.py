@@ -775,6 +775,7 @@ class ProfQuizzerApp:
             )
         )
         self._apply_ui_window_mode()
+        page.run_task(page.window.center)
 
         # Restore saved session directly at launch if available
         saved_session = _load_session()
